@@ -1,2 +1,2 @@
 ## THIS IS NOT A FULL MODEL (yet)
-as of now, this model has 55.84 millions parameters, which on my hardware, takes a week to train. So instead of training it and not being able to revise the code for a week, I'm just open sourcing the AI brain itself for others to use.
+as of now, this model has 55.84 million parameters, which on my hardware, takes a week to train. So instead of training it and not being able to revise the code for a week, I'm just open sourcing the AI brain itself for others to use.
