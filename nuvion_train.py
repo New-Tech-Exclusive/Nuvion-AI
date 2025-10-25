@@ -94,10 +94,10 @@ METRICS_LOG = defaultdict(list)
 
 
 # ========================
-# MEMORY OPTIMIZATIONS - ENHANCED FOR RTX 3070
+# MEMORY OPTIMIZATIONS 
 # ========================
 def setup_memory_optimizations():
-    # Enable all available optimizations for RTX 3070
+    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True  # Optimizes for fixed input sizes
@@ -116,7 +116,7 @@ def setup_memory_optimizations():
 
 
 # ========================
-# CORE COMPONENTS (UNCHANGED)
+# CORE COMPONENTS
 # ========================
 
 class LongRoPE(nn.Module):
@@ -2183,7 +2183,6 @@ def train_nuvion():
 if __name__ == "__main__":
     print("🚀 Nuvion Pro AI Training System")
     print("📚 English Language Only")
-    print("⚡ Training Mode - RTX 3070 Optimized")
     print("=" * 50)
 
     train_nuvion()
