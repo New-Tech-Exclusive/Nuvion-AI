@@ -11,17 +11,19 @@ from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 from tqdm import tqdm
-import sys
 import re
 import random
 import time
+import numpy as np
+from collections import defaultdict
+import json
 
 # ========================
 # CONFIGURATION
 # ========================
 DEV_MODE = True
 DEV_SAMPLE_PER_DS = 8000 if DEV_MODE else None
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 32768 if not DEV_MODE else 4096
 BATCH_SIZE = 1 if DEV_MODE else 1
 GRAD_ACCUM_STEPS = 32 if DEV_MODE else 64
 NUM_EPOCHS = 20 if DEV_MODE else 50
@@ -36,17 +38,36 @@ if DEV_MODE:
     NUM_LAYERS = 24
     DIM_FEEDFORWARD = 4096
     MODEL_SIZE = "418M"
+    NUM_EXPERTS = 8
+    EXPERTS_PER_TOKEN = 2
 else:
     D_MODEL = 2048
     NHEAD = 32
     NUM_LAYERS = 36
     DIM_FEEDFORWARD = 8192
     MODEL_SIZE = "2.3B"
+    NUM_EXPERTS = 16
+    EXPERTS_PER_TOKEN = 2
 
 DROPOUT = 0.1
 VOCAB_SIZE = 32000
 
+# Feature flags
 USE_GRADIENT_CHECKPOINTING = True
+USE_MOE = False
+USE_LONGROPE = True
+USE_FLASH_ATTENTION = True
+USE_LORA = False
+USE_QUANTIZATION = False
+USE_RAG = False
+USE_SPECULATIVE_DECODING = False
+USE_CHAIN_OF_THOUGHT = True
+USE_CONTRASTIVE_DECODING = True
+USE_SAFETY_FILTER = True
+USE_MULTIMODAL = False
+
+LORA_RANK = 8
+LORA_ALPHA = 16
 
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 SPECIAL_TOKENS = ["<unk>", "<pad>", "<s>", "</s>"]
@@ -56,9 +77,15 @@ ASSISTANT_MARKER = "###ASSISTANT###"
 USER_MARKER = "###USER###"
 REASONING_START_MARKER = "###REASONING###"
 REASONING_END_MARKER = "###END_REASONING###"
+REFLECTION_MARKER = "###REFLECTION###"
+COT_MARKER = "###COT###"
+SAFETY_MARKER = "###SAFE###"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 ULTIMATE MERGED | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
+print(f"🚀 Nuvion Advanced | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
+
+# Metrics tracking
+METRICS_LOG = defaultdict(list)
 
 
 # ========================
@@ -79,7 +106,298 @@ def setup_memory_optimizations():
 
 
 # ========================
-# REPETITION PENALTY SYSTEM
+# LONGROPE POSITIONAL ENCODING
+# ========================
+class LongRoPE(nn.Module):
+    """Extended context via LongRoPE interpolation"""
+
+    def __init__(self, dim, max_seq_len=MAX_SEQ_LEN, base=10000, scaling_factor=1.0):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.scaling_factor = scaling_factor
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = inv_freq / scaling_factor
+        self.register_buffer("inv_freq", inv_freq)
+
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _update_cos_sin_cache(self, seq_len, device):
+        if seq_len != self._seq_len_cached or self._cos_cached is None:
+            self._seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._cos_cached = emb.cos()[None, :, None, :]
+            self._sin_cached = emb.sin()[None, :, None, :]
+        return self._cos_cached, self._sin_cached
+
+    def apply_rotary_pos_emb(self, q, k):
+        batch, seq_len, heads, dim = q.shape
+        cos, sin = self._update_cos_sin_cache(seq_len, q.device)
+
+        cos = cos[..., :dim]
+        sin = sin[..., :dim]
+
+        q_rot = q.reshape(batch, seq_len, heads, dim // 2, 2)
+        k_rot = k.reshape(batch, seq_len, heads, dim // 2, 2)
+
+        q_rot_real = q_rot[..., 0] * cos[..., ::2] - q_rot[..., 1] * sin[..., ::2]
+        q_rot_imag = q_rot[..., 0] * sin[..., ::2] + q_rot[..., 1] * cos[..., ::2]
+        k_rot_real = k_rot[..., 0] * cos[..., ::2] - k_rot[..., 1] * sin[..., ::2]
+        k_rot_imag = k_rot[..., 0] * sin[..., ::2] + k_rot[..., 1] * cos[..., ::2]
+
+        q = torch.stack([q_rot_real, q_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
+        k = torch.stack([k_rot_real, k_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
+
+        return q, k
+
+
+# ========================
+# QUANTIZATION SUPPORT
+# ========================
+class QuantizedLinear(nn.Module):
+    """4-bit/8-bit quantized linear layer for inference"""
+
+    def __init__(self, in_features, out_features, bits=8):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bits = bits
+
+        self.register_buffer('weight_quantized', torch.zeros(out_features, in_features, dtype=torch.int8))
+        self.register_buffer('scale', torch.ones(out_features))
+        self.register_buffer('zero_point', torch.zeros(out_features))
+
+    def quantize_weight(self, weight):
+        """Quantize fp32 weight to int8"""
+        min_val = weight.min(dim=1, keepdim=True)[0]
+        max_val = weight.max(dim=1, keepdim=True)[0]
+
+        scale = (max_val - min_val) / (2 ** self.bits - 1)
+        zero_point = -min_val / scale
+
+        quantized = torch.clamp(
+            torch.round(weight / scale + zero_point),
+            0, 2 ** self.bits - 1
+        ).to(torch.int8)
+
+        self.weight_quantized.copy_(quantized)
+        self.scale.copy_(scale.squeeze())
+        self.zero_point.copy_(zero_point.squeeze())
+
+    def forward(self, x):
+        weight = (self.weight_quantized.float() - self.zero_point.unsqueeze(1)) * self.scale.unsqueeze(1)
+        return torch.nn.functional.linear(x, weight)
+
+
+# ========================
+# RETRIEVAL-AUGMENTED GENERATION
+# ========================
+class SimpleRAG:
+    """Lightweight RAG with in-memory vector store"""
+
+    def __init__(self, embedding_dim=D_MODEL, max_docs=1000):
+        self.embedding_dim = embedding_dim
+        self.documents = []
+        self.embeddings = []
+        self.max_docs = max_docs
+
+    def add_document(self, text, embedding):
+        """Add document to retrieval store"""
+        if len(self.documents) >= self.max_docs:
+            self.documents.pop(0)
+            self.embeddings.pop(0)
+
+        self.documents.append(text)
+        self.embeddings.append(embedding.cpu().numpy())
+
+    def retrieve(self, query_embedding, top_k=3):
+        """Retrieve top-k relevant documents"""
+        if not self.embeddings:
+            return []
+
+        query_emb = query_embedding.cpu().numpy()
+        embeddings_array = np.array(self.embeddings)
+
+        similarities = np.dot(embeddings_array, query_emb) / (
+                np.linalg.norm(embeddings_array, axis=1) * np.linalg.norm(query_emb) + 1e-8
+        )
+
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        return [self.documents[i] for i in top_indices]
+
+
+# ========================
+# SAFETY FILTER
+# ========================
+class SafetyFilter:
+    """Rule-based safety filter for harmful content"""
+
+    def __init__(self):
+        self.harmful_patterns = [
+            r'\b(kill|murder|harm|attack|weapon|bomb|terrorist)\b',
+            r'\b(hate|racist|discriminat)\w*\b',
+            r'\b(illegal|drug|cocaine|heroin)\b',
+            r'\b(porn|sexual|explicit)\b',
+        ]
+        self.compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.harmful_patterns]
+
+    def is_safe(self, text):
+        """Check if text is safe to output"""
+        for pattern in self.compiled_patterns:
+            if pattern.search(text):
+                return False
+        return True
+
+    def filter_response(self, text):
+        """Return filtered response or warning"""
+        if self.is_safe(text):
+            return text
+        return "I apologize, but I cannot provide that response."
+
+
+# ========================
+# EVALUATION SUITE
+# ========================
+class EvaluationSuite:
+    """Automated evaluation metrics"""
+
+    def __init__(self):
+        self.metrics = defaultdict(list)
+
+    def compute_bleu(self, reference, hypothesis):
+        """Simple BLEU-1 score"""
+        ref_tokens = set(reference.lower().split())
+        hyp_tokens = hypothesis.lower().split()
+
+        if not hyp_tokens:
+            return 0.0
+
+        matches = sum(1 for token in hyp_tokens if token in ref_tokens)
+        return matches / len(hyp_tokens)
+
+    def compute_rouge_l(self, reference, hypothesis):
+        """Simple ROUGE-L score"""
+        ref_tokens = reference.lower().split()
+        hyp_tokens = hypothesis.lower().split()
+
+        if not ref_tokens or not hyp_tokens:
+            return 0.0
+
+        m, n = len(ref_tokens), len(hyp_tokens)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if ref_tokens[i - 1] == hyp_tokens[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                else:
+                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+
+        lcs = dp[m][n]
+        precision = lcs / n if n > 0 else 0
+        recall = lcs / m if m > 0 else 0
+
+        if precision + recall == 0:
+            return 0.0
+        return 2 * precision * recall / (precision + recall)
+
+    def detect_hallucination(self, text, context=""):
+        """Simple hallucination detection"""
+        uncertainty_markers = ["i think", "maybe", "possibly", "i'm not sure", "i don't know"]
+        has_uncertainty = any(marker in text.lower() for marker in uncertainty_markers)
+
+        if not context and any(word in text.lower() for word in ["exactly", "precisely", "definitely"]):
+            return True
+
+        return False
+
+    def log_metrics(self, metric_name, value):
+        """Log metric for tracking"""
+        self.metrics[metric_name].append(value)
+        METRICS_LOG[metric_name].append(value)
+
+    def get_summary(self):
+        """Get metric summary"""
+        summary = {}
+        for name, values in self.metrics.items():
+            if values:
+                summary[name] = {
+                    'mean': np.mean(values),
+                    'std': np.std(values),
+                    'min': np.min(values),
+                    'max': np.max(values)
+                }
+        return summary
+
+
+# ========================
+# SPECULATIVE DECODING
+# ========================
+class SpeculativeDecoder:
+    """Draft-verify speculative decoding for faster inference"""
+
+    def __init__(self, draft_model, main_model):
+        self.draft_model = draft_model
+        self.main_model = main_model
+
+    def generate_speculative(self, input_ids, num_draft_tokens=5):
+        """Generate using draft model and verify with main model"""
+        with torch.no_grad():
+            draft_ids = input_ids.clone()
+            draft_tokens = []
+
+            for _ in range(num_draft_tokens):
+                draft_output = self.draft_model(draft_ids)
+                draft_logits = draft_output['logits'][:, -1, :]
+                next_token = torch.argmax(draft_logits, dim=-1)
+                draft_tokens.append(next_token.item())
+                draft_ids = torch.cat([draft_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
+
+            verify_ids = torch.cat([input_ids, torch.tensor([[t] for t in draft_tokens], device=input_ids.device).T],
+                                   dim=1)
+            verify_output = self.main_model(verify_ids)
+            verify_logits = verify_output['logits']
+
+            accepted_tokens = []
+            for i, draft_token in enumerate(draft_tokens):
+                verify_probs = torch.softmax(verify_logits[:, input_ids.size(1) + i - 1, :], dim=-1)
+                if verify_probs[0, draft_token] > 0.5:
+                    accepted_tokens.append(draft_token)
+                else:
+                    break
+
+            return accepted_tokens
+
+
+# ========================
+# CONTRASTIVE DECODING
+# ========================
+class ContrastiveDecoder:
+    """Contrastive decoding to reduce hallucinations"""
+
+    def __init__(self, alpha=0.5, beta=0.5):
+        self.alpha = alpha
+        self.beta = beta
+
+    def decode(self, expert_logits, amateur_logits=None):
+        """Apply contrastive decoding"""
+        if amateur_logits is None:
+            return expert_logits
+
+        expert_probs = torch.softmax(expert_logits / self.alpha, dim=-1)
+        amateur_probs = torch.softmax(amateur_logits / self.beta, dim=-1)
+
+        contrastive_logits = torch.log(expert_probs + 1e-10) - torch.log(amateur_probs + 1e-10)
+        return contrastive_logits
+
+
+# ========================
+# ADVANCED REPETITION PENALTY
 # ========================
 class AdvancedRepetitionPenalty:
     def __init__(self, tokenizer):
@@ -315,7 +633,7 @@ class AdvancedRepetitionPenalty:
                 issues.append("Topic stagnation")
 
             if issues:
-                report.append("\n⚠️  Detected Issues:")
+                report.append("\n⚠️ Detected Issues:")
                 for issue in issues:
                     report.append(f"  - {issue}")
             else:
@@ -325,60 +643,60 @@ class AdvancedRepetitionPenalty:
 
 
 # ========================
-# ROTARY EMBEDDINGS
+# LORA LAYERS
 # ========================
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=MAX_SEQ_LEN, base=10000):
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation for efficient fine-tuning"""
+
+    def __init__(self, in_features, out_features, rank=LORA_RANK, alpha=LORA_ALPHA):
         super().__init__()
-        self.dim = dim
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.alpha = alpha
 
-    def _update_cos_sin_cache(self, seq_len, device):
-        if seq_len != self._seq_len_cached:
-            self._seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            self._cos_cached = emb.cos()[None, :, None, :]
-            self._sin_cached = emb.sin()[None, :, None, :]
-        return self._cos_cached, self._sin_cached
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.weight.requires_grad = False
 
-    def apply_rotary_pos_emb(self, q, k):
-        batch, seq_len, heads, dim = q.shape
-        cos, sin = self._update_cos_sin_cache(seq_len, q.device)
+        if rank > 0:
+            self.lora_A = nn.Parameter(torch.randn(rank, in_features))
+            self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+            self.scaling = alpha / rank
 
-        cos = cos[..., :dim]
-        sin = sin[..., :dim]
+        self.bias = None
 
-        q_rot = q.reshape(batch, seq_len, heads, dim // 2, 2)
-        k_rot = k.reshape(batch, seq_len, heads, dim // 2, 2)
+    def forward(self, x):
+        result = torch.nn.functional.linear(x, self.weight, self.bias)
 
-        q_rot_real = q_rot[..., 0] * cos[..., ::2] - q_rot[..., 1] * sin[..., ::2]
-        q_rot_imag = q_rot[..., 0] * sin[..., ::2] + q_rot[..., 1] * cos[..., ::2]
-        k_rot_real = k_rot[..., 0] * cos[..., ::2] - k_rot[..., 1] * sin[..., ::2]
-        k_rot_imag = k_rot[..., 0] * sin[..., ::2] + k_rot[..., 1] * cos[..., ::2]
+        if self.rank > 0 and self.training:
+            lora_result = torch.nn.functional.linear(
+                torch.nn.functional.linear(x, self.lora_A),
+                self.lora_B
+            )
+            result = result + lora_result * self.scaling
 
-        q = torch.stack([q_rot_real, q_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
-        k = torch.stack([k_rot_real, k_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
+        return result
 
-        return q, k
+    def merge_weights(self):
+        """Merge LoRA weights into main weight for inference"""
+        if self.rank > 0:
+            self.weight.data += (self.lora_B @ self.lora_A) * self.scaling
+            self.lora_A = None
+            self.lora_B = None
 
 
 # ========================
-# MULTI-QUERY ATTENTION
+# MULTI-QUERY ATTENTION WITH LONGROPE
 # ========================
 class MultiQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, dropout=0.1):
+    def __init__(self, d_model, num_heads, dropout=0.1, use_longrope=USE_LONGROPE):
         super().__init__()
         assert d_model % num_heads == 0
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.use_longrope = use_longrope
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, self.head_dim)
@@ -387,7 +705,10 @@ class MultiQueryAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.scale = self.head_dim ** -0.5
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
+
+        if use_longrope:
+            scaling_factor = MAX_SEQ_LEN / 2048.0
+            self.rope = LongRoPE(self.head_dim, max_seq_len=MAX_SEQ_LEN, scaling_factor=scaling_factor)
 
     def forward(self, x, attention_mask=None):
         batch_size, seq_len, _ = x.shape
@@ -396,23 +717,31 @@ class MultiQueryAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
         v = self.v_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
 
-        q, k = self.rotary_emb.apply_rotary_pos_emb(q, k)
+        if self.use_longrope:
+            q, k = self.rope.apply_rotary_pos_emb(q, k)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if USE_FLASH_ATTENTION and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=(attention_mask is None)
+            )
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        if attention_mask is not None:
-            scores = scores + attention_mask
+            if attention_mask is not None:
+                scores = scores + attention_mask
 
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_output = torch.matmul(attn_weights, v)
 
-        attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-
         return self.out_proj(attn_output)
 
 
@@ -426,27 +755,140 @@ class SwiGLU(nn.Module):
 
 
 # ========================
-# TRANSFORMER BLOCK
+# MIXTURE OF EXPERTS
 # ========================
-class EnhancedTransformerBlock(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+class Expert(nn.Module):
+    """Single expert FFN with specialization"""
+
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, expert_type="general"):
         super().__init__()
-
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiQueryAttention(d_model, nhead, dropout)
-
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
+        self.expert_type = expert_type
+        self.net = nn.Sequential(
             nn.Linear(d_model, dim_feedforward * 2),
             SwiGLU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, d_model),
             nn.Dropout(dropout)
         )
+        self.usage_count = 0
+
+    def forward(self, x):
+        self.usage_count += x.size(0)
+        return self.net(x)
+
+
+class MixtureOfExperts(nn.Module):
+    """Enhanced Sparse MoE with domain specialization"""
+
+    def __init__(self, d_model, dim_feedforward, num_experts=NUM_EXPERTS,
+                 experts_per_token=EXPERTS_PER_TOKEN, dropout=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts_per_token = experts_per_token
+        self.d_model = d_model
+
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.noise_std = 0.1
+
+        expert_types = ["reasoning", "code", "chat", "math"] * (num_experts // 4 + 1)
+        self.experts = nn.ModuleList([
+            Expert(d_model, dim_feedforward, dropout, expert_type=expert_types[i])
+            for i in range(num_experts)
+        ])
+
+        self.register_buffer('expert_counts', torch.zeros(num_experts))
+        self.register_buffer('expert_importance', torch.zeros(num_experts))
+
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.shape
+        x_flat = x.view(-1, d_model)
+
+        router_logits = self.gate(x_flat)
+        if self.training:
+            noise = torch.randn_like(router_logits) * self.noise_std
+            router_logits = router_logits + noise
+
+        router_probs = torch.softmax(router_logits, dim=-1)
+        expert_weights, expert_indices = torch.topk(
+            router_probs, self.experts_per_token, dim=-1
+        )
+        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+
+        if self.training:
+            importance = router_probs.sum(dim=0)
+            self.expert_importance += importance
+
+        output = torch.zeros_like(x_flat)
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (expert_indices == i).any(dim=-1)
+            if expert_mask.any():
+                expert_input = x_flat[expert_mask]
+                expert_output = expert(expert_input)
+
+                weights = expert_weights[expert_mask]
+                weights = weights[expert_indices[expert_mask] == i].unsqueeze(-1)
+
+                output[expert_mask] += expert_output * weights
+
+                if self.training:
+                    self.expert_counts[i] += expert_mask.sum().item()
+
+        return output.view(batch_size, seq_len, d_model)
+
+    def get_load_balancing_loss(self):
+        """Enhanced auxiliary loss for balanced expert usage"""
+        if not self.training:
+            return 0.0
+
+        total = self.expert_counts.sum()
+        if total == 0:
+            return 0.0
+
+        target = total / self.num_experts
+        cv = torch.std(self.expert_counts) / (torch.mean(self.expert_counts) + 1e-8)
+
+        importance_loss = torch.std(self.expert_importance) / (torch.mean(self.expert_importance) + 1e-8)
+
+        self.expert_counts.zero_()
+        self.expert_importance.zero_()
+
+        return (cv + importance_loss) * 0.01
+
+    def get_expert_stats(self):
+        """Get expert utilization statistics"""
+        stats = {}
+        for i, expert in enumerate(self.experts):
+            stats[f"expert_{i}_{expert.expert_type}"] = expert.usage_count
+        return stats
+
+
+# ========================
+# TRANSFORMER BLOCK
+# ========================
+class EnhancedTransformerBlock(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, use_moe=USE_MOE):
+        super().__init__()
+
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiQueryAttention(d_model, nhead, dropout)
+
+        self.ln2 = nn.LayerNorm(d_model)
+
+        if use_moe:
+            self.mlp = MixtureOfExperts(d_model, dim_feedforward, dropout=dropout)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward * 2),
+                SwiGLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            )
 
         self.dropout = nn.Dropout(dropout)
-
         self.use_checkpoint = USE_GRADIENT_CHECKPOINTING
+        self.use_moe = use_moe
 
     def forward(self, x, attention_mask=None):
         if self.use_checkpoint and self.training:
@@ -469,6 +911,7 @@ class EnhancedTransformerBlock(nn.Module):
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
+
             return custom_forward
 
         residual = x
@@ -492,28 +935,119 @@ class EnhancedTransformerBlock(nn.Module):
 
         return x
 
+    def get_aux_loss(self):
+        """Get auxiliary losses"""
+        if self.use_moe and isinstance(self.mlp, MixtureOfExperts):
+            return self.mlp.get_load_balancing_loss()
+        return 0.0
+
 
 # ========================
 # REASONING MODULE
 # ========================
 class ReasoningModule(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_layers=2):
+    """Enhanced reasoning with CoT support"""
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_layers=3):
         super().__init__()
         self.layers = nn.ModuleList([
-            EnhancedTransformerBlock(d_model, nhead, dim_feedforward, dropout)
+            EnhancedTransformerBlock(d_model, nhead, dim_feedforward, dropout, use_moe=False)
             for _ in range(num_layers)
         ])
+
+        self.cot_attention = MultiQueryAttention(d_model, nhead, dropout)
+        self.cot_ln = nn.LayerNorm(d_model)
 
     def forward(self, x, attn_mask=None):
         for layer in self.layers:
             x = layer(x, attn_mask)
+
+        residual = x
+        x = self.cot_ln(x)
+        x = residual + self.cot_attention(x, attn_mask)
+
         return x
+
+
+# ========================
+# SELF-REFLECTION MODULE
+# ========================
+class SelfReflectionModule(nn.Module):
+    """Enhanced evaluator with quality metrics"""
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.attention = MultiQueryAttention(d_model, nhead, dropout)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+
+        self.quality_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+        self.confidence_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+        self.coherence_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, attention_mask=None):
+        attn_out = self.attention(self.ln1(x), attention_mask)
+        pooled = attn_out.mean(dim=1)
+
+        quality = self.quality_head(pooled)
+        confidence = self.confidence_head(pooled)
+        coherence = self.coherence_head(pooled)
+
+        return quality, confidence, coherence
+
+
+# ========================
+# PREFERENCE HEAD
+# ========================
+class PreferenceHead(nn.Module):
+    """Enhanced preference optimization"""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.preference_scorer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, 1)
+        )
+
+        self.helpfulness_scorer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+    def forward(self, hidden_states):
+        pooled = hidden_states.mean(dim=1)
+        preference = self.preference_scorer(pooled)
+        helpfulness = self.helpfulness_scorer(pooled)
+        return preference, helpfulness
 
 
 # ========================
 # MAIN MODEL
 # ========================
-class UltimateNuvionGPT(nn.Module):
+class Nuvion(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE):
         super().__init__()
         self.vocab_size = vocab_size
@@ -529,10 +1063,17 @@ class UltimateNuvionGPT(nn.Module):
         ])
 
         self.reasoning_module = ReasoningModule(D_MODEL, NHEAD, DIM_FEEDFORWARD, DROPOUT)
+        self.reflection_module = SelfReflectionModule(D_MODEL, NHEAD, DIM_FEEDFORWARD, DROPOUT)
+        self.preference_head = PreferenceHead(D_MODEL)
 
         self.ln_f = nn.LayerNorm(D_MODEL)
         self.lm_head = nn.Linear(D_MODEL, vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
+
+        self.rag_system = SimpleRAG() if USE_RAG else None
+        self.safety_filter = SafetyFilter() if USE_SAFETY_FILTER else None
+        self.contrastive_decoder = ContrastiveDecoder() if USE_CONTRASTIVE_DECODING else None
+        self.evaluator = EvaluationSuite()
 
         self.role_penalty_tokens = set()
         self.uncertainty_penalty_tokens = set()
@@ -540,7 +1081,12 @@ class UltimateNuvionGPT(nn.Module):
 
         self._init_weights()
         param_count = sum(p.numel() for p in self.parameters())
-        print(f"✅ Ultimate Model: {param_count:,} parameters (~{param_count / 1e6:.0f}M)")
+        trainable_count = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        print(f"✅ Nuvion Model: {param_count:,} parameters (~{param_count / 1e6:.0f}M)")
+        print(f"   Trainable: {trainable_count:,} parameters")
+        print(f"   Features: LongRoPE={USE_LONGROPE}, MoE={USE_MOE}, FlashAttn={USE_FLASH_ATTENTION}")
+        print(f"   Advanced: RAG={USE_RAG}, Safety={USE_SAFETY_FILTER}, CoT={USE_CHAIN_OF_THOUGHT}")
 
     def _init_weights(self):
         for module in self.modules():
@@ -614,7 +1160,8 @@ class UltimateNuvionGPT(nn.Module):
 
         return logits - penalty_mask
 
-    def forward(self, input_ids, attention_mask=None, use_reasoning=False):
+    def forward(self, input_ids, attention_mask=None, use_reasoning=False,
+                return_preference_score=False, return_reflection=False, use_rag=False):
         batch_size, seq_len = input_ids.shape
 
         causal_mask = torch.triu(
@@ -626,28 +1173,57 @@ class UltimateNuvionGPT(nn.Module):
         x = self.token_embedding(input_ids) * math.sqrt(self.d_model)
         x = self.embed_dropout(x)
 
+        if use_rag and self.rag_system:
+            query_emb = x[:, -1, :].mean(dim=0)
+            retrieved_docs = self.rag_system.retrieve(query_emb, top_k=2)
+            pass
+
+        aux_losses = []
         for block in self.blocks:
             x = block(x, causal_mask)
+            aux_loss = block.get_aux_loss()
+            if aux_loss > 0:
+                aux_losses.append(aux_loss)
 
         if use_reasoning:
             x = self.reasoning_module(x, causal_mask)
 
         x = self.ln_f(x)
-        logits = self.lm_head(x)
 
-        return logits
+        outputs = {}
+        outputs['hidden_states'] = x
+        outputs['logits'] = self.lm_head(x)
+
+        if aux_losses:
+            outputs['aux_loss'] = sum(aux_losses) / len(aux_losses)
+
+        if return_preference_score:
+            pref_score, help_score = self.preference_head(x)
+            outputs['preference_score'] = pref_score
+            outputs['helpfulness_score'] = help_score
+
+        if return_reflection:
+            quality, confidence, coherence = self.reflection_module(x, causal_mask)
+            outputs['quality_score'] = quality
+            outputs['confidence_score'] = confidence
+            outputs['coherence_score'] = coherence
+
+        return outputs
 
     def generate(self, prompt, tokenizer, max_new_tokens=200, temperature=0.8,
                  top_k=50, top_p=0.92, repetition_penalty=1.15, penalty_strength=3.0,
-                 advanced_penalties=True, use_reasoning=False, reasoning_steps=3):
+                 advanced_penalties=True, use_reasoning=False, reasoning_steps=3,
+                 use_reflection=True, reflection_threshold=0.7,
+                 use_contrastive=USE_CONTRASTIVE_DECODING, use_rag=USE_RAG,
+                 apply_safety=USE_SAFETY_FILTER):
         self.eval()
 
         if self.advanced_penalty_system is None and advanced_penalties:
             self.init_advanced_penalty(tokenizer)
 
-        if use_reasoning:
+        if use_reasoning and USE_CHAIN_OF_THOUGHT:
             reasoning_prompt = f"{prompt}\n\nLet me think through this step by step:"
-            full_prompt = f"<s>{USER_MARKER}{reasoning_prompt}\n\n{ASSISTANT_MARKER}{REASONING_START_MARKER}"
+            full_prompt = f"<s>{USER_MARKER}{reasoning_prompt}\n\n{ASSISTANT_MARKER}{REASONING_START_MARKER}{COT_MARKER}"
         else:
             if not prompt.startswith("<s>"):
                 full_prompt = f"<s>{USER_MARKER}{prompt}\n\n{ASSISTANT_MARKER}"
@@ -667,6 +1243,9 @@ class UltimateNuvionGPT(nn.Module):
 
         in_reasoning_phase = use_reasoning
         reasoning_count = 0
+        reflection_attempts = 0
+
+        start_time = time.time()
 
         if use_reasoning:
             print("🤔 Thinking...", end="", flush=True)
@@ -677,8 +1256,29 @@ class UltimateNuvionGPT(nn.Module):
                     input_ids = input_ids[:, -MAX_SEQ_LEN:]
 
                 apply_reasoning = (step < reasoning_steps * 10) and in_reasoning_phase
-                logits = self.forward(input_ids, use_reasoning=apply_reasoning)
+                outputs = self.forward(input_ids, use_reasoning=apply_reasoning,
+                                       return_reflection=use_reflection, use_rag=use_rag)
+
+                logits = outputs['logits']
                 next_logits = logits[0, -1, :] / temperature
+
+                if use_contrastive and self.contrastive_decoder:
+                    amateur_logits = logits[0, -1, :] / (temperature * 1.5)
+                    next_logits = self.contrastive_decoder.decode(next_logits, amateur_logits)
+
+                if use_reflection and step > 10 and step % 20 == 0:
+                    quality = outputs.get('quality_score', torch.tensor([1.0]))
+                    confidence = outputs.get('confidence_score', torch.tensor([1.0]))
+                    coherence = outputs.get('coherence_score', torch.tensor([1.0]))
+
+                    avg_score = (quality.item() + confidence.item() + coherence.item()) / 3
+
+                    if avg_score < reflection_threshold:
+                        reflection_attempts += 1
+                        if reflection_attempts < 3:
+                            temperature *= 0.9
+                            top_p *= 0.95
+                            print("🔄", end="", flush=True)
 
                 if (self.role_penalty_tokens or self.uncertainty_penalty_tokens or
                         repetition_penalty > 1.0 or advanced_penalties):
@@ -713,6 +1313,7 @@ class UltimateNuvionGPT(nn.Module):
                     break
 
                 current_text = tokenizer.decode(generated + [token_id])
+
                 if REASONING_END_MARKER in current_text or reasoning_count >= reasoning_steps * 15:
                     in_reasoning_phase = False
                     if use_reasoning:
@@ -732,6 +1333,8 @@ class UltimateNuvionGPT(nn.Module):
                 current_text = tokenizer.decode(full_generated_tokens)
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
 
+        generation_time = time.time() - start_time
+
         if use_reasoning:
             print()
 
@@ -739,12 +1342,95 @@ class UltimateNuvionGPT(nn.Module):
         result = result.replace("<s>", "").replace("</s>", "")
         result = result.replace(USER_MARKER, "").replace(ASSISTANT_MARKER, "")
         result = result.replace(REASONING_START_MARKER, "").replace(REASONING_END_MARKER, "")
+        result = result.replace(COT_MARKER, "")
+
+        if apply_safety and self.safety_filter:
+            result = self.safety_filter.filter_response(result)
+
+        self.evaluator.log_metrics("generation_time", generation_time)
+        self.evaluator.log_metrics("tokens_generated", len(generated))
+        self.evaluator.log_metrics("tokens_per_second", len(generated) / generation_time if generation_time > 0 else 0)
 
         if advanced_penalties and self.advanced_penalty_system:
             analysis = self.advanced_penalty_system.get_analysis_report()
             print(f"\n{analysis}\n")
 
+        print(
+            f"⚡ Generated {len(generated)} tokens in {generation_time:.2f}s ({len(generated) / generation_time:.1f} tok/s)")
+
         return result.strip()
+
+    def enable_lora(self, rank=LORA_RANK, alpha=LORA_ALPHA):
+        """Convert linear layers to LoRA for fine-tuning"""
+        print(f"🔧 Enabling LoRA (rank={rank}, alpha={alpha})")
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and 'lm_head' not in name:
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+
+                parent = self
+                for part in parent_name.split('.'):
+                    if part:
+                        parent = getattr(parent, part)
+
+                lora_layer = LoRALinear(
+                    module.in_features,
+                    module.out_features,
+                    rank=rank,
+                    alpha=alpha
+                )
+                lora_layer.weight.data = module.weight.data.clone()
+                if module.bias is not None:
+                    lora_layer.bias = nn.Parameter(module.bias.data.clone())
+
+                setattr(parent, child_name, lora_layer)
+
+        for name, param in self.named_parameters():
+            if 'lora_' not in name:
+                param.requires_grad = False
+
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"✅ LoRA enabled: {trainable:,} trainable parameters")
+
+    def enable_quantization(self, bits=8):
+        """Convert model to quantized inference mode"""
+        print(f"🔧 Enabling {bits}-bit quantization")
+
+        quantized_count = 0
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and 'lm_head' not in name:
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+
+                parent = self
+                for part in parent_name.split('.'):
+                    if part:
+                        parent = getattr(parent, part)
+
+                quant_layer = QuantizedLinear(
+                    module.in_features,
+                    module.out_features,
+                    bits=bits
+                )
+                quant_layer.quantize_weight(module.weight.data)
+
+                setattr(parent, child_name, quant_layer)
+                quantized_count += 1
+
+        print(f"✅ Quantization enabled: {quantized_count} layers quantized")
+
+    def get_expert_statistics(self):
+        """Get MoE expert utilization stats"""
+        if not USE_MOE:
+            return {}
+
+        stats = {}
+        for i, block in enumerate(self.blocks):
+            if hasattr(block, 'mlp') and isinstance(block.mlp, MixtureOfExperts):
+                stats[f"block_{i}"] = block.mlp.get_expert_stats()
+
+        return stats
 
 
 # ========================
@@ -786,26 +1472,41 @@ def is_code_heavy(text):
 
 
 # ========================
+# CHAIN-OF-THOUGHT DATA FORMATTER
+# ========================
+def format_chain_of_thought(question, answer):
+    """Format data with explicit CoT reasoning"""
+    cot_templates = [
+        f"Let me break this down step by step:\n\n1. First, {answer[:len(answer) // 3]}\n2. Then, {answer[len(answer) // 3:2 * len(answer) // 3]}\n3. Finally, {answer[2 * len(answer) // 3:]}",
+        f"Here's my reasoning:\n\nStep 1: {answer[:len(answer) // 2]}\nStep 2: {answer[len(answer) // 2:]}",
+        f"Let me think through this:\n\n{answer}"
+    ]
+
+    template = random.choice(cot_templates)
+    return f"<s>{USER_MARKER}{question}\n\n{ASSISTANT_MARKER}{COT_MARKER}{template}</s>"
+
+
+# ========================
 # DATASET LOADING
 # ========================
-def load_ultimate_datasets():
-    print("🚀 Loading multi-domain datasets...")
+def load_nuvion_datasets():
+    print("🚀 Loading multi-domain datasets with CoT enhancement...")
     sample = DEV_SAMPLE_PER_DS
 
     all_samples = []
 
     dataset_configs = [
-        ("HuggingFaceH4/ultrachat_200k", "train_sft", None, format_conversation, 0.20),
+        ("HuggingFaceH4/ultrachat_200k", "train_sft", None, format_conversation, 0.18),
         ("Anthropic/hh-rlhf", "train", None, format_conversation, 0.10),
         ("allenai/openbookqa", "train", "main", format_qa, 0.08),
         ("tau/commonsense_qa", "train", None, format_qa, 0.08),
         ("google/boolq", "train", None, format_qa, 0.05),
-        ("garage-bAInd/Open-Platypus", "train", None, format_instruction, 0.04),
-        ("tatsu-lab/alpaca", "train", None, format_instruction, 0.10),
-        ("databricks/databricks-dolly-15k", "train", None, format_instruction, 0.10),
+        ("garage-bAInd/Open-Platypus", "train", None, format_instruction, 0.05),
+        ("tatsu-lab/alpaca", "train", None, format_instruction, 0.08),
+        ("databricks/databricks-dolly-15k", "train", None, format_instruction, 0.08),
         ("sahil2801/CodeAlpaca-20k", "train", None, format_code, 0.08),
         ("iamtarun/code_instructions_120k_alpaca", "train", None, format_code, 0.07),
-        ("openai/gsm8k", "train", "main", format_math, 0.10),
+        ("openai/gsm8k", "train", "main", format_math_cot, 0.15),
     ]
 
     for name, split, config, formatter, weight in dataset_configs:
@@ -954,12 +1655,16 @@ def format_code(example):
     return None
 
 
-def format_math(example):
+def format_math_cot(example):
+    """Enhanced math formatting with Chain-of-Thought"""
     if "question" in example and "answer" in example:
         q = clean_text_improved(str(example["question"]))
         a = clean_text_improved(str(example["answer"]))
         if q and a:
-            return f"<s>{USER_MARKER}{q}\n\n{ASSISTANT_MARKER}Let me solve this step by step:\n{a}</s>"
+            if USE_CHAIN_OF_THOUGHT:
+                return f"<s>{USER_MARKER}{q}\n\n{ASSISTANT_MARKER}{COT_MARKER}Let me solve this step by step:\n\n{a}</s>"
+            else:
+                return f"<s>{USER_MARKER}{q}\n\n{ASSISTANT_MARKER}Let me solve this step by step:\n{a}</s>"
     return None
 
 
@@ -1032,7 +1737,7 @@ def safe_load_dataset(name, split="train", sample=None, config=None):
 # ========================
 # TOKENIZER
 # ========================
-def get_or_train_tokenizer(dataset, path="tokenizer_ultimate.json"):
+def get_or_train_tokenizer(dataset, path="tokenizer_nuvion.json"):
     if os.path.exists(path):
         print(f"Loading tokenizer from {path}")
         return Tokenizer.from_file(path)
@@ -1062,12 +1767,12 @@ def get_or_train_tokenizer(dataset, path="tokenizer_ultimate.json"):
 # ========================
 # DATASET
 # ========================
-class UltimateDataset(Dataset):
+class NuvionDataset(Dataset):
     def __init__(self, dataset, tokenizer):
         self.samples = []
         self.masks = []
 
-        max_tokens = 512 if DEV_MODE else 1024
+        max_tokens = 1024 if DEV_MODE else 2048
         skipped_short = 0
         skipped_long = 0
         skipped_uncertainty = 0
@@ -1124,6 +1829,25 @@ def collate_fn(batch):
 
 
 # ========================
+# PREFERENCE OPTIMIZATION LOSS
+# ========================
+def preference_loss(policy_chosen_logps, policy_rejected_logps,
+                    reference_chosen_logps, reference_rejected_logps, beta=0.1):
+    """Direct Preference Optimization loss"""
+    policy_logratios = policy_chosen_logps - policy_rejected_logps
+    reference_logratios = reference_chosen_logps - reference_rejected_logps
+
+    losses = -torch.nn.functional.logsigmoid(
+        beta * (policy_logratios - reference_logratios)
+    )
+
+    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps)
+    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps)
+
+    return losses.mean(), chosen_rewards.mean(), rejected_rewards.mean()
+
+
+# ========================
 # SCHEDULER
 # ========================
 class CosineWithRestartsScheduler:
@@ -1157,13 +1881,14 @@ class CosineWithRestartsScheduler:
 # ========================
 def find_existing_model():
     model_files = [
-        "nuvion_ultimate_400m_best.pth",
-        "nuvion_ultimate_1.5b_best.pth",
-        "nuvion_ultimate_400m_final.pth",
+        "nuvion_418m_best.pth",
+        "nuvion_2.3b_best.pth",
+        "nuvion_418m_advanced_best.pth",
+        "nuvion_400m_best.pth",
     ]
     for f in model_files:
         if os.path.exists(f):
-            print(f"📁 Found: {f}")
+            print(f"📂 Found: {f}")
             return f
     return None
 
@@ -1173,7 +1898,7 @@ def load_existing_model(model, path, optimizer=None):
         checkpoint = torch.load(path, map_location=device)
 
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             print(f"✅ Loaded model from {path}")
 
             if optimizer and 'optimizer_state_dict' in checkpoint:
@@ -1185,15 +1910,15 @@ def load_existing_model(model, path, optimizer=None):
             print(f"📊 Resuming from epoch {start_epoch}, loss: {best_loss:.4f}")
             return start_epoch, best_loss
         else:
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(checkpoint, strict=False)
             return 0, float('inf')
     except Exception as e:
-        print(f"❌ Error loading: {e}")
+        print(f"⚠️ Error loading: {e}")
         return 0, float('inf')
 
 
 # ========================
-# TESTING
+# TESTING WITH EVALUATION SUITE
 # ========================
 def test_model_capabilities(model, tokenizer):
     model.eval()
@@ -1207,7 +1932,8 @@ def test_model_capabilities(model, tokenizer):
                 if not ids:
                     continue
                 tensor = torch.tensor([ids], device=device)
-                logits = model(tensor)
+                outputs = model(tensor)
+                logits = outputs['logits']
 
                 if torch.isnan(logits).any() or torch.isinf(logits).any():
                     print(f"   ❌ {text}: Invalid outputs")
@@ -1236,6 +1962,8 @@ def test_generation_progressive(model, tokenizer, epoch):
         temp = 0.7
 
     print(f"\n🧪 Epoch {epoch} Generation Test:")
+    evaluator = model.evaluator
+
     for i, prompt in enumerate(prompts, 1):
         try:
             response = model.generate(
@@ -1246,9 +1974,19 @@ def test_generation_progressive(model, tokenizer, epoch):
             )
             print(f"   {i}. {prompt[:50]}...")
             print(f"      → {response[:150]}...")
+
+            if epoch > 5:
+                bleu = evaluator.compute_bleu(prompt, response)
+                rouge = evaluator.compute_rouge_l(prompt, response)
+                hallucination = evaluator.detect_hallucination(response, prompt)
+
+                evaluator.log_metrics(f"bleu_epoch_{epoch}", bleu)
+                evaluator.log_metrics(f"rouge_epoch_{epoch}", rouge)
+                evaluator.log_metrics(f"hallucination_epoch_{epoch}", 1 if hallucination else 0)
         except Exception as e:
             print(f"   {i}. {prompt[:50]}...")
             print(f"      → ERROR: {e}")
+
     model.train()
     print()
 
@@ -1256,16 +1994,16 @@ def test_generation_progressive(model, tokenizer, epoch):
 # ========================
 # TRAINING LOOP
 # ========================
-def train_ultimate():
-    print("🚀 Training ULTIMATE Nuvion GPT")
+def train_nuvion():
+    print("🚀 Training Nuvion Advanced")
     print("=" * 70)
 
     setup_memory_optimizations()
 
-    dataset = load_ultimate_datasets()
+    dataset = load_nuvion_datasets()
     tokenizer = get_or_train_tokenizer(dataset)
 
-    train_dataset = UltimateDataset(dataset, tokenizer)
+    train_dataset = NuvionDataset(dataset, tokenizer)
     if len(train_dataset) == 0:
         print("❌ No training data")
         return
@@ -1280,11 +2018,14 @@ def train_ultimate():
         persistent_workers=False
     )
 
-    model = UltimateNuvionGPT(vocab_size=tokenizer.get_vocab_size()).to(device)
+    model = Nuvion(vocab_size=tokenizer.get_vocab_size()).to(device)
     model.set_penalty_tokens(tokenizer)
 
+    if USE_LORA:
+        model.enable_lora()
+
     optimizer = optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=LEARNING_RATE,
         betas=(0.9, 0.98),
         eps=1e-8,
@@ -1305,12 +2046,23 @@ def train_ultimate():
     if existing:
         start_epoch, best_loss = load_existing_model(model, existing, optimizer)
 
-    print(f"\n🎯 Training Configuration:")
+    print(f"\n🎯 Advanced Training Configuration:")
     print(f"   Model: {MODEL_SIZE}")
     print(f"   Sequence length: {MAX_SEQ_LEN} tokens")
     print(f"   Batch size: {BATCH_SIZE} (effective: {BATCH_SIZE * GRAD_ACCUM_STEPS})")
-    print(f"   Gradient checkpointing: {'ENABLED' if USE_GRADIENT_CHECKPOINTING else 'DISABLED'}")
-    print(f"   Epochs: {NUM_EPOCHS} (from {start_epoch})")
+    print(f"\n   🔥 Advanced Features Enabled:")
+    print(f"      ✅ LongRoPE: {USE_LONGROPE} (up to {MAX_SEQ_LEN} tokens)")
+    print(f"      ✅ MoE: {USE_MOE} ({NUM_EXPERTS} experts, {EXPERTS_PER_TOKEN} per token)")
+    print(f"      ✅ FlashAttention: {USE_FLASH_ATTENTION}")
+    print(f"      ✅ Chain-of-Thought: {USE_CHAIN_OF_THOUGHT}")
+    print(f"      ✅ Contrastive Decoding: {USE_CONTRASTIVE_DECODING}")
+    print(f"      ✅ Safety Filter: {USE_SAFETY_FILTER}")
+    print(f"      ✅ RAG: {USE_RAG}")
+    print(f"      ✅ Speculative Decoding: {USE_SPECULATIVE_DECODING}")
+    print(f"      ✅ LoRA: {USE_LORA}")
+    print(f"      ✅ Quantization: {USE_QUANTIZATION}")
+    print(f"      ✅ Gradient Checkpointing: {USE_GRADIENT_CHECKPOINTING}")
+    print(f"\n   Epochs: {NUM_EPOCHS} (from {start_epoch})")
     print(f"   Samples: {len(train_dataset)}")
     print("=" * 70)
 
@@ -1326,6 +2078,7 @@ def train_ultimate():
     for epoch in range(start_epoch, NUM_EPOCHS):
         model.train()
         epoch_loss = 0
+        epoch_aux_loss = 0
         steps = 0
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}")
@@ -1343,23 +2096,40 @@ def train_ultimate():
 
             if scaler:
                 with torch.amp.autocast('cuda', dtype=torch.float16):
-                    logits = model(inputs)
+                    outputs = model(inputs)
+                    logits = outputs['logits']
+
                     loss_fct = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
                     losses = loss_fct(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
                     losses = losses.view(targets.shape)
                     masked_losses = losses * target_mask
                     num_tokens = target_mask.sum()
                     loss = masked_losses.sum() / num_tokens if num_tokens > 0 else masked_losses.sum()
+
+                    if 'aux_loss' in outputs:
+                        aux_loss = outputs['aux_loss']
+                        loss = loss + aux_loss
+                        epoch_aux_loss += aux_loss.item()
+
                     loss = loss / GRAD_ACCUM_STEPS
+
                 scaler.scale(loss).backward()
             else:
-                logits = model(inputs)
+                outputs = model(inputs)
+                logits = outputs['logits']
+
                 loss_fct = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
                 losses = loss_fct(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
                 losses = losses.view(targets.shape)
                 masked_losses = losses * target_mask
                 num_tokens = target_mask.sum()
                 loss = masked_losses.sum() / num_tokens if num_tokens > 0 else masked_losses.sum()
+
+                if 'aux_loss' in outputs:
+                    aux_loss = outputs['aux_loss']
+                    loss = loss + aux_loss
+                    epoch_aux_loss += aux_loss.item()
+
                 loss = loss / GRAD_ACCUM_STEPS
                 loss.backward()
 
@@ -1384,22 +2154,30 @@ def train_ultimate():
             steps += 1
 
             if batch_idx % 10 == 0:
-                loop.set_postfix({
+                postfix = {
                     'loss': f'{loss.item() * GRAD_ACCUM_STEPS:.4f}',
                     'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
                     'step': global_step
-                })
+                }
+                if 'aux_loss' in outputs:
+                    postfix['aux'] = f'{outputs["aux_loss"].item():.4f}'
+                loop.set_postfix(postfix)
 
         avg_loss = epoch_loss / steps if steps > 0 else float('inf')
-        print(f"\n📊 Epoch {epoch + 1}/{NUM_EPOCHS} - Loss: {avg_loss:.4f}")
+        avg_aux_loss = epoch_aux_loss / steps if steps > 0 else 0.0
+
+        print(f"\n📊 Epoch {epoch + 1}/{NUM_EPOCHS} - Loss: {avg_loss:.4f}", end="")
+        if avg_aux_loss > 0:
+            print(f" | Aux Loss: {avg_aux_loss:.4f}", end="")
+        print()
 
         if epoch % 2 == 0 or epoch == NUM_EPOCHS - 1:
             test_generation_progressive(model, tokenizer, epoch + 1)
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            suffix = "400m" if DEV_MODE else "1.5b"
-            checkpoint_path = f"nuvion_ultimate_{suffix}_best.pth"
+            suffix = "418M" if DEV_MODE else "2.3B"
+            checkpoint_path = f"nuvion_{suffix}_advanced_best.pth"
 
             torch.save({
                 'epoch': epoch,
@@ -1412,18 +2190,17 @@ def train_ultimate():
                     'nhead': NHEAD,
                     'num_layers': NUM_LAYERS,
                     'max_seq_len': MAX_SEQ_LEN,
-                    'model_size': MODEL_SIZE
+                    'model_size': MODEL_SIZE,
                 }
             }, checkpoint_path)
             print(f"💾 Best model saved: {checkpoint_path} (loss: {best_loss:.4f})")
 
     suffix = "418M" if DEV_MODE else "2.3B"
-    final_path = f"nuvion_ultimate_{suffix}_final.pth"
+    final_path = f"nuvion_{suffix}_advanced_final.pth"
     torch.save(model.state_dict(), final_path)
-    print(f"\n🎉 Ultimate training complete! Best loss: {best_loss:.4f}")
-    print(f"📁 Saved: {final_path}")
-    print("\n💡 Run nuvion_ultimate_chat.py to interact with your model!")
+    print(f"\n🎉 Nuvion Advanced training complete! Best loss: {best_loss:.4f}")
+    print(f"📂 Saved: {final_path}")
 
 
 if __name__ == "__main__":
-    train_ultimate()
+    train_nuvion()
