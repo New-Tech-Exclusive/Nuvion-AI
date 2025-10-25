@@ -13,4 +13,4 @@
 ---
 
 ## 🚀 Current model
-- ⚡ **Nuvion Advanced** - Has many different customizations, architecture option (Mixture of Experts, Model Parameters, Etc...) 
+- ⚡ **Nuvion Pro** - Has many different customizations, architecture option (Mixture of Experts, Model Parameters, Etc...) 
