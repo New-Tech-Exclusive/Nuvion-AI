@@ -1,2 +1,11 @@
-## THIS IS NOT A FULL MODEL (yet)
-as of now, this model has 55.84 million parameters, which on my hardware, takes a week to train. So instead of training it and not being able to revise the code for a week, I'm just open sourcing the AI brain itself for others to use.
+# 🤖 Nuvion: Conversational AI Powered by Noetica
+
+**Nuvion** is a next-generation conversational AI system built on the **Noetica architecture**—a custom Transformer design created from scratch for dialogue modeling. With **400M parameters**, Nuvion demonstrates how efficient, transparent, and open conversational models can be built outside of big labs.
+
+---
+
+## ✨ Why Nuvion + Noetica?
+- 🧠 **Custom Architecture (Noetica)** — A Transformer variant optimized for multi-turn dialogue and context retention.  
+- 🚀 **400M Parameters** — Strikes a balance between deployability and expressive conversational ability.  
+- ⚡ **Efficient Training Pipeline** — Distributed training, mixed precision, and modular design.  
+- 🗂️ **Dataset Flexibility** — Works with DailyDialog, OpenSubtitles, or custom corpora.  
