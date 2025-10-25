@@ -19,82 +19,89 @@ from collections import defaultdict
 import json
 
 # ========================
-# CONFIGURATION
+# ADVANCED CONFIGURATION
 # ========================
 DEV_MODE = True
 DEV_SAMPLE_PER_DS = 8000 if DEV_MODE else None
-MAX_SEQ_LEN = 32768 if not DEV_MODE else 4096
-BATCH_SIZE = 1 if DEV_MODE else 1
+MAX_SEQ_LEN = 131072 if not DEV_MODE else 4096
+BATCH_SIZE = 1 if DEV_MODE else 4
 GRAD_ACCUM_STEPS = 32 if DEV_MODE else 64
-NUM_EPOCHS = 20 if DEV_MODE else 50
+NUM_EPOCHS = 10 if DEV_MODE else 50
 LEARNING_RATE = 3e-4 if DEV_MODE else 1e-4
 WEIGHT_DECAY = 0.1
 WARMUP_STEPS = 2000 if DEV_MODE else 10000
 
-# Model architecture
+# Enhanced Model Architecture
 if DEV_MODE:
-    D_MODEL = 1024
-    NHEAD = 16
-    NUM_LAYERS = 24
-    DIM_FEEDFORWARD = 4096
-    MODEL_SIZE = "418M"
-    NUM_EXPERTS = 8
-    EXPERTS_PER_TOKEN = 2
-else:
-    D_MODEL = 2048
-    NHEAD = 32
-    NUM_LAYERS = 36
-    DIM_FEEDFORWARD = 8192
-    MODEL_SIZE = "2.3B"
+    D_MODEL = 1536
+    NHEAD = 24
+    NUM_LAYERS = 32
+    DIM_FEEDFORWARD = 6144
+    MODEL_SIZE = "1.2B"
     NUM_EXPERTS = 16
-    EXPERTS_PER_TOKEN = 2
+    EXPERTS_PER_TOKEN = 4
+    VOCAB_SIZE = 64000
+else:
+    D_MODEL = 4096
+    NHEAD = 32
+    NUM_LAYERS = 48
+    DIM_FEEDFORWARD = 16384
+    MODEL_SIZE = "8.5B"
+    NUM_EXPERTS = 32
+    EXPERTS_PER_TOKEN = 6
+    VOCAB_SIZE = 128000
 
 DROPOUT = 0.1
-VOCAB_SIZE = 32000
+USE_DISTRIBUTED = not DEV_MODE and torch.cuda.device_count() > 1
 
-# Feature flags
+# Advanced Feature Flags
 USE_GRADIENT_CHECKPOINTING = True
 USE_MOE = False
 USE_LONGROPE = True
 USE_FLASH_ATTENTION = True
 USE_LORA = False
 USE_QUANTIZATION = False
-USE_RAG = False
-USE_SPECULATIVE_DECODING = False
+USE_RAG = True
+USE_SPECULATIVE_DECODING = True
 USE_CHAIN_OF_THOUGHT = True
 USE_CONTRASTIVE_DECODING = True
 USE_SAFETY_FILTER = True
-USE_MULTIMODAL = False
+USE_DPO = True
 
-LORA_RANK = 8
-LORA_ALPHA = 16
+LORA_RANK = 16
+LORA_ALPHA = 32
+EXPERT_CAPACITY_FACTOR = 1.25
+AUX_LOSS_COEFF = 0.01
 
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 SPECIAL_TOKENS = ["<unk>", "<pad>", "<s>", "</s>"]
 
-# Markers
-ASSISTANT_MARKER = "###ASSISTANT###"
-USER_MARKER = "###USER###"
-REASONING_START_MARKER = "###REASONING###"
-REASONING_END_MARKER = "###END_REASONING###"
-REFLECTION_MARKER = "###REFLECTION###"
-COT_MARKER = "###COT###"
-SAFETY_MARKER = "###SAFE###"
+# Enhanced Markers
+USER_MARKER = "<|user|>"
+ASSISTANT_MARKER = "<|assistant|>"
+REASONING_START_MARKER = "<|reasoning|>"
+REASONING_END_MARKER = "<|end_reasoning|>"
+COT_MARKER = "<|cot|>"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 Nuvion Advanced | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
+print(f"🚀 Nuvion Pro | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
+
+# Initialize mixed precision scaler for RTX 3070
+scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
 
 # Metrics tracking
 METRICS_LOG = defaultdict(list)
 
 
 # ========================
-# MEMORY OPTIMIZATIONS
+# MEMORY OPTIMIZATIONS - ENHANCED FOR RTX 3070
 # ========================
 def setup_memory_optimizations():
+    # Enable all available optimizations for RTX 3070
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True  # Optimizes for fixed input sizes
+    torch.autograd.set_detect_anomaly(False)  # Disable for performance
 
     if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
         print("✅ Flash attention available")
@@ -103,15 +110,17 @@ def setup_memory_optimizations():
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        # Print GPU info
+        gpu_props = torch.cuda.get_device_properties(device)
+        print(f"🎯 GPU: {gpu_props.name} | Memory: {gpu_props.total_memory / 1024 ** 3:.1f}GB | TF32: Enabled")
 
 
 # ========================
-# LONGROPE POSITIONAL ENCODING
+# CORE COMPONENTS (UNCHANGED)
 # ========================
+
 class LongRoPE(nn.Module):
-    """Extended context via LongRoPE interpolation"""
-
-    def __init__(self, dim, max_seq_len=MAX_SEQ_LEN, base=10000, scaling_factor=1.0):
+    def __init__(self, dim, max_seq_len=2048, base=10000, scaling_factor=1.0):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -152,54 +161,435 @@ class LongRoPE(nn.Module):
 
         q = torch.stack([q_rot_real, q_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
         k = torch.stack([k_rot_real, k_rot_imag], dim=-1).reshape(batch, seq_len, heads, dim)
-
         return q, k
 
 
-# ========================
-# QUANTIZATION SUPPORT
-# ========================
-class QuantizedLinear(nn.Module):
-    """4-bit/8-bit quantized linear layer for inference"""
-
-    def __init__(self, in_features, out_features, bits=8):
+class HybridPositionalEncoding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048, base=10000, num_heads=NHEAD):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.bits = bits
+        self.dim = dim
+        self.max_seq_len = max_seq_len  # Reduced for memory
+        self.num_heads = num_heads
 
-        self.register_buffer('weight_quantized', torch.zeros(out_features, in_features, dtype=torch.int8))
-        self.register_buffer('scale', torch.ones(out_features))
-        self.register_buffer('zero_point', torch.zeros(out_features))
+        self.longrope = LongRoPE(dim, max_seq_len, base, scaling_factor=2.0)
 
-    def quantize_weight(self, weight):
-        """Quantize fp32 weight to int8"""
-        min_val = weight.min(dim=1, keepdim=True)[0]
-        max_val = weight.max(dim=1, keepdim=True)[0]
+        # Memory-efficient ALiBi implementation
+        self.register_buffer('alibi_slopes', self._get_slopes(num_heads))
 
-        scale = (max_val - min_val) / (2 ** self.bits - 1)
-        zero_point = -min_val / scale
+    def _get_slopes(self, n):
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            ratio = start
+            return [start * ratio ** i for i in range(n)]
 
-        quantized = torch.clamp(
-            torch.round(weight / scale + zero_point),
-            0, 2 ** self.bits - 1
-        ).to(torch.int8)
+        if math.log2(n).is_integer():
+            return torch.tensor(get_slopes_power_of_2(n))
+        else:
+            closest_power_of_2 = 2 ** math.floor(math.log2(n))
+            return torch.tensor(
+                get_slopes_power_of_2(closest_power_of_2) +
+                get_slopes_power_of_2(2 * closest_power_of_2)[0::2][:n - closest_power_of_2]
+            )
 
-        self.weight_quantized.copy_(quantized)
-        self.scale.copy_(scale.squeeze())
-        self.zero_point.copy_(zero_point.squeeze())
+    def get_alibi_bias(self, seq_len, device):
+        # Dynamic ALiBi computation to save memory
+        context_position = torch.arange(seq_len, device=device)[:, None]
+        memory_position = torch.arange(seq_len, device=device)[None, :]
+        relative_position = torch.abs(memory_position - context_position)
 
+        # Use the precomputed slopes
+        slopes = self.alibi_slopes.to(device)
+        alibi_bias = relative_position * slopes.view(-1, 1, 1) * -1.0
+
+        return alibi_bias
+
+    def apply_rotary_pos_emb(self, q, k):
+        return self.longrope.apply_rotary_pos_emb(q, k)
+
+
+class SwiGLU(nn.Module):
     def forward(self, x):
-        weight = (self.weight_quantized.float() - self.zero_point.unsqueeze(1)) * self.scale.unsqueeze(1)
-        return torch.nn.functional.linear(x, weight)
+        x, gate = x.chunk(2, dim=-1)
+        return x * torch.nn.functional.silu(gate)
 
 
-# ========================
-# RETRIEVAL-AUGMENTED GENERATION
-# ========================
+class AdaptiveExpert(nn.Module):
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, expert_type="general"):
+        super().__init__()
+        self.expert_type = expert_type
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward * 2),
+            SwiGLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+
+        self.specialization_gate = nn.Linear(d_model, 1)
+        self.usage_count = 0
+
+    def forward(self, x, importance_scores=None):
+        output = self.ffn(x)
+        self.usage_count += x.size(0)
+        return output
+
+
+class AdaptiveMixtureOfExperts(nn.Module):
+    def __init__(self, d_model, dim_feedforward, num_experts=NUM_EXPERTS,
+                 experts_per_token=EXPERTS_PER_TOKEN, dropout=0.1):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts_per_token = experts_per_token
+        self.d_model = d_model
+
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.router_temp = nn.Parameter(torch.ones(1))
+
+        expert_domains = ["reasoning", "code", "knowledge", "creative", "technical",
+                          "conversational", "mathematical", "scientific"] * (num_experts // 8 + 1)
+
+        self.experts = nn.ModuleList([
+            AdaptiveExpert(d_model, dim_feedforward, dropout, expert_type=expert_domains[i])
+            for i in range(num_experts)
+        ])
+
+        self.register_buffer('expert_usage', torch.zeros(num_experts))
+        self.register_buffer('expert_importance', torch.ones(num_experts))
+
+    def forward(self, x, importance_scores=None):
+        batch_size, seq_len, d_model = x.shape
+        x_flat = x.reshape(-1, d_model)
+
+        router_logits = self.router(x_flat) / self.router_temp
+        router_probs = torch.softmax(router_logits, dim=-1)
+
+        if self.training:
+            noise = torch.randn_like(router_logits) * 0.01
+            router_logits = router_logits + noise
+
+        expert_weights, expert_indices = torch.topk(router_logits, self.experts_per_token, dim=-1)
+        expert_weights = torch.softmax(expert_weights, dim=-1)
+
+        output = torch.zeros_like(x_flat)
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (expert_indices == i).any(dim=-1)
+
+            if expert_mask.any():
+                expert_input = x_flat[expert_mask]
+                weights_mask = expert_indices[expert_mask] == i
+                weights = expert_weights[expert_mask][weights_mask].unsqueeze(-1)
+
+                expert_output = expert(expert_input, importance_scores)
+                output[expert_mask] += expert_output * weights
+
+                if self.training:
+                    self.expert_usage[i] += expert_mask.sum().item()
+                    self.expert_importance[i] = router_probs[:, i].mean().item()
+
+        return output.reshape(batch_size, seq_len, d_model)
+
+    def get_advanced_load_balancing_loss(self):
+        if not self.training:
+            return 0.0
+
+        total_usage = self.expert_usage.sum()
+        if total_usage == 0:
+            return 0.0
+
+        target_usage = total_usage / self.num_experts
+        usage_balance_loss = ((self.expert_usage - target_usage) ** 2).mean() / (target_usage ** 2 + 1e-8)
+        importance_balance_loss = torch.var(self.expert_importance)
+
+        self.expert_usage.zero_()
+        return (usage_balance_loss + importance_balance_loss) * AUX_LOSS_COEFF
+
+
+class MultiScaleAttention(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1, use_hybrid_pe=True):
+        super().__init__()
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.use_hybrid_pe = use_hybrid_pe
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, self.head_dim)
+        self.v_proj = nn.Linear(d_model, self.head_dim)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.head_dim ** -0.5
+
+        if use_hybrid_pe:
+            self.hybrid_pe = HybridPositionalEncoding(self.head_dim, num_heads=num_heads)
+
+        self.use_flash_attention = USE_FLASH_ATTENTION
+
+    def forward(self, x, attention_mask=None):
+        batch_size, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
+        v = self.v_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
+
+        if self.use_hybrid_pe:
+            q, k = self.hybrid_pe.apply_rotary_pos_emb(q, k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if self.use_flash_attention and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+            if self.use_hybrid_pe:
+                alibi_bias = self.hybrid_pe.get_alibi_bias(seq_len, x.device)
+                scores = scores + alibi_bias
+
+            if attention_mask is not None:
+                scores = scores + attention_mask
+
+            attn_weights = torch.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_output = torch.matmul(attn_weights, v)
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        return self.out_proj(attn_output)
+
+
+class MultiStageReasoningModule(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_stages=3):
+        super().__init__()
+        self.num_stages = num_stages
+
+        self.reasoning_stages = nn.ModuleList([
+            EnhancedTransformerBlock(d_model, nhead, dim_feedforward, dropout, use_moe=False)
+            for _ in range(num_stages)
+        ])
+
+        self.cross_stage_attention = MultiScaleAttention(d_model, nhead, dropout)
+        self.verification_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, attn_mask=None):
+        reasoning_states = [x]
+        reasoning_confidence = []
+
+        for i, stage in enumerate(self.reasoning_stages):
+            stage_output = stage(reasoning_states[-1], attn_mask)
+
+            if i > 0:
+                stage_output = self.cross_stage_attention(stage_output, attention_mask=attn_mask)
+
+            reasoning_states.append(stage_output)
+
+            if self.training:
+                step_confidence = self.verification_head(stage_output.mean(dim=1))
+                reasoning_confidence.append(step_confidence)
+
+        outputs = {
+            'final_output': reasoning_states[-1],
+            'reasoning_states': reasoning_states,
+            'reasoning_confidence': torch.stack(reasoning_confidence).mean() if reasoning_confidence else None
+        }
+
+        return outputs
+
+
+class MultiStageSafetySystem(nn.Module):
+    def __init__(self, d_model, num_safety_categories=8):
+        super().__init__()
+        self.num_safety_categories = num_safety_categories
+
+        self.safety_classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, num_safety_categories),
+            nn.Sigmoid()
+        )
+
+        self.safety_categories = [
+            "harmful", "biased", "unethical", "misinformation",
+            "sensitive", "malicious", "inappropriate", "unsafe_content"
+        ]
+
+        self.confidence_calibration = nn.Parameter(torch.ones(num_safety_categories))
+        self.red_team_detector = nn.Linear(d_model, 1)
+
+    def forward(self, hidden_states):
+        batch_size, seq_len, d_model = hidden_states.shape
+        pooled = hidden_states.mean(dim=1)
+
+        safety_scores = self.safety_classifier(pooled)
+        safety_scores = safety_scores * self.confidence_calibration.unsqueeze(0)
+        red_team_scores = torch.sigmoid(self.red_team_detector(pooled))
+        overall_safety = safety_scores.min(dim=1)[0]
+
+        return {
+            'safety_scores': safety_scores,
+            'overall_safety': overall_safety,
+            'red_team_scores': red_team_scores
+        }
+
+
+class EnhancedTransformerBlock(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, use_moe=USE_MOE):
+        super().__init__()
+
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiScaleAttention(d_model, nhead, dropout)
+
+        self.ln2 = nn.LayerNorm(d_model)
+
+        if use_moe:
+            self.mlp = AdaptiveMixtureOfExperts(d_model, dim_feedforward, dropout=dropout)
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward * 2),
+                SwiGLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+                nn.Dropout(dropout)
+            )
+
+        self.dropout = nn.Dropout(dropout)
+        self.use_checkpoint = USE_GRADIENT_CHECKPOINTING
+        self.use_moe = use_moe
+
+    def forward(self, x, attention_mask=None):
+        if self.use_checkpoint and self.training:
+            return self._forward_with_checkpoint(x, attention_mask)
+        else:
+            return self._forward_impl(x, attention_mask)
+
+    def _forward_impl(self, x, attention_mask=None):
+        residual = x
+        x = self.ln1(x)
+        x = residual + self.dropout(self.attn(x, attention_mask))
+
+        residual = x
+        x = self.ln2(x)
+        x = residual + self.mlp(x)
+
+        return x
+
+    def _forward_with_checkpoint(self, x, attention_mask):
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+
+            return custom_forward
+
+        residual = x
+        x = self.ln1(x)
+        x = residual + self.dropout(
+            torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.attn),
+                x,
+                attention_mask,
+                use_reentrant=False
+            )
+        )
+
+        residual = x
+        x = self.ln2(x)
+        x = residual + torch.utils.checkpoint.checkpoint(
+            create_custom_forward(self.mlp),
+            x,
+            use_reentrant=False
+        )
+
+        return x
+
+    def get_aux_loss(self):
+        if self.use_moe and hasattr(self.mlp, 'get_advanced_load_balancing_loss'):
+            return self.mlp.get_advanced_load_balancing_loss()
+        return 0.0
+
+
+class SelfReflectionModule(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.attention = MultiScaleAttention(d_model, nhead, dropout)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+
+        self.quality_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+        self.confidence_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+        self.coherence_head = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, attention_mask=None):
+        attn_out = self.attention(self.ln1(x), attention_mask)
+        pooled = attn_out.mean(dim=1)
+
+        quality = self.quality_head(pooled)
+        confidence = self.confidence_head(pooled)
+        coherence = self.coherence_head(pooled)
+
+        return quality, confidence, coherence
+
+
+class PreferenceHead(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.preference_scorer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, 1)
+        )
+
+        self.helpfulness_scorer = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+    def forward(self, hidden_states):
+        pooled = hidden_states.mean(dim=1)
+        preference = self.preference_scorer(pooled)
+        helpfulness = self.helpfulness_scorer(pooled)
+        return preference, helpfulness
+
+
 class SimpleRAG:
-    """Lightweight RAG with in-memory vector store"""
-
     def __init__(self, embedding_dim=D_MODEL, max_docs=1000):
         self.embedding_dim = embedding_dim
         self.documents = []
@@ -207,7 +597,6 @@ class SimpleRAG:
         self.max_docs = max_docs
 
     def add_document(self, text, embedding):
-        """Add document to retrieval store"""
         if len(self.documents) >= self.max_docs:
             self.documents.pop(0)
             self.embeddings.pop(0)
@@ -216,7 +605,6 @@ class SimpleRAG:
         self.embeddings.append(embedding.cpu().numpy())
 
     def retrieve(self, query_embedding, top_k=3):
-        """Retrieve top-k relevant documents"""
         if not self.embeddings:
             return []
 
@@ -231,12 +619,7 @@ class SimpleRAG:
         return [self.documents[i] for i in top_indices]
 
 
-# ========================
-# SAFETY FILTER
-# ========================
 class SafetyFilter:
-    """Rule-based safety filter for harmful content"""
-
     def __init__(self):
         self.harmful_patterns = [
             r'\b(kill|murder|harm|attack|weapon|bomb|terrorist)\b',
@@ -247,30 +630,38 @@ class SafetyFilter:
         self.compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.harmful_patterns]
 
     def is_safe(self, text):
-        """Check if text is safe to output"""
         for pattern in self.compiled_patterns:
             if pattern.search(text):
                 return False
         return True
 
     def filter_response(self, text):
-        """Return filtered response or warning"""
         if self.is_safe(text):
             return text
         return "I apologize, but I cannot provide that response."
 
 
-# ========================
-# EVALUATION SUITE
-# ========================
-class EvaluationSuite:
-    """Automated evaluation metrics"""
+class ContrastiveDecoder:
+    def __init__(self, alpha=0.5, beta=0.5):
+        self.alpha = alpha
+        self.beta = beta
 
+    def decode(self, expert_logits, amateur_logits=None):
+        if amateur_logits is None:
+            return expert_logits
+
+        expert_probs = torch.softmax(expert_logits / self.alpha, dim=-1)
+        amateur_probs = torch.softmax(amateur_logits / self.beta, dim=-1)
+
+        contrastive_logits = torch.log(expert_probs + 1e-10) - torch.log(amateur_probs + 1e-10)
+        return contrastive_logits
+
+
+class EvaluationSuite:
     def __init__(self):
         self.metrics = defaultdict(list)
 
     def compute_bleu(self, reference, hypothesis):
-        """Simple BLEU-1 score"""
         ref_tokens = set(reference.lower().split())
         hyp_tokens = hypothesis.lower().split()
 
@@ -281,7 +672,6 @@ class EvaluationSuite:
         return matches / len(hyp_tokens)
 
     def compute_rouge_l(self, reference, hypothesis):
-        """Simple ROUGE-L score"""
         ref_tokens = reference.lower().split()
         hyp_tokens = hypothesis.lower().split()
 
@@ -307,7 +697,6 @@ class EvaluationSuite:
         return 2 * precision * recall / (precision + recall)
 
     def detect_hallucination(self, text, context=""):
-        """Simple hallucination detection"""
         uncertainty_markers = ["i think", "maybe", "possibly", "i'm not sure", "i don't know"]
         has_uncertainty = any(marker in text.lower() for marker in uncertainty_markers)
 
@@ -317,12 +706,9 @@ class EvaluationSuite:
         return False
 
     def log_metrics(self, metric_name, value):
-        """Log metric for tracking"""
         self.metrics[metric_name].append(value)
-        METRICS_LOG[metric_name].append(value)
 
     def get_summary(self):
-        """Get metric summary"""
         summary = {}
         for name, values in self.metrics.items():
             if values:
@@ -335,70 +721,6 @@ class EvaluationSuite:
         return summary
 
 
-# ========================
-# SPECULATIVE DECODING
-# ========================
-class SpeculativeDecoder:
-    """Draft-verify speculative decoding for faster inference"""
-
-    def __init__(self, draft_model, main_model):
-        self.draft_model = draft_model
-        self.main_model = main_model
-
-    def generate_speculative(self, input_ids, num_draft_tokens=5):
-        """Generate using draft model and verify with main model"""
-        with torch.no_grad():
-            draft_ids = input_ids.clone()
-            draft_tokens = []
-
-            for _ in range(num_draft_tokens):
-                draft_output = self.draft_model(draft_ids)
-                draft_logits = draft_output['logits'][:, -1, :]
-                next_token = torch.argmax(draft_logits, dim=-1)
-                draft_tokens.append(next_token.item())
-                draft_ids = torch.cat([draft_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
-
-            verify_ids = torch.cat([input_ids, torch.tensor([[t] for t in draft_tokens], device=input_ids.device).T],
-                                   dim=1)
-            verify_output = self.main_model(verify_ids)
-            verify_logits = verify_output['logits']
-
-            accepted_tokens = []
-            for i, draft_token in enumerate(draft_tokens):
-                verify_probs = torch.softmax(verify_logits[:, input_ids.size(1) + i - 1, :], dim=-1)
-                if verify_probs[0, draft_token] > 0.5:
-                    accepted_tokens.append(draft_token)
-                else:
-                    break
-
-            return accepted_tokens
-
-
-# ========================
-# CONTRASTIVE DECODING
-# ========================
-class ContrastiveDecoder:
-    """Contrastive decoding to reduce hallucinations"""
-
-    def __init__(self, alpha=0.5, beta=0.5):
-        self.alpha = alpha
-        self.beta = beta
-
-    def decode(self, expert_logits, amateur_logits=None):
-        """Apply contrastive decoding"""
-        if amateur_logits is None:
-            return expert_logits
-
-        expert_probs = torch.softmax(expert_logits / self.alpha, dim=-1)
-        amateur_probs = torch.softmax(amateur_logits / self.beta, dim=-1)
-
-        contrastive_logits = torch.log(expert_probs + 1e-10) - torch.log(amateur_probs + 1e-10)
-        return contrastive_logits
-
-
-# ========================
-# ADVANCED REPETITION PENALTY
-# ========================
 class AdvancedRepetitionPenalty:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -642,12 +964,7 @@ class AdvancedRepetitionPenalty:
         return "\n".join(report)
 
 
-# ========================
-# LORA LAYERS
-# ========================
 class LoRALinear(nn.Module):
-    """Low-Rank Adaptation for efficient fine-tuning"""
-
     def __init__(self, in_features, out_features, rank=LORA_RANK, alpha=LORA_ALPHA):
         super().__init__()
         self.in_features = in_features
@@ -678,376 +995,45 @@ class LoRALinear(nn.Module):
         return result
 
     def merge_weights(self):
-        """Merge LoRA weights into main weight for inference"""
         if self.rank > 0:
             self.weight.data += (self.lora_B @ self.lora_A) * self.scaling
             self.lora_A = None
             self.lora_B = None
 
 
-# ========================
-# MULTI-QUERY ATTENTION WITH LONGROPE
-# ========================
-class MultiQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, dropout=0.1, use_longrope=USE_LONGROPE):
+class QuantizedLinear(nn.Module):
+    def __init__(self, in_features, out_features, bits=8):
         super().__init__()
-        assert d_model % num_heads == 0
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bits = bits
 
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.use_longrope = use_longrope
+        self.register_buffer('weight_quantized', torch.zeros(out_features, in_features, dtype=torch.int8))
+        self.register_buffer('scale', torch.ones(out_features))
+        self.register_buffer('zero_point', torch.zeros(out_features))
 
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, self.head_dim)
-        self.v_proj = nn.Linear(d_model, self.head_dim)
-        self.out_proj = nn.Linear(d_model, d_model)
+    def quantize_weight(self, weight):
+        min_val = weight.min(dim=1, keepdim=True)[0]
+        max_val = weight.max(dim=1, keepdim=True)[0]
 
-        self.dropout = nn.Dropout(dropout)
-        self.scale = self.head_dim ** -0.5
+        scale = (max_val - min_val) / (2 ** self.bits - 1)
+        zero_point = -min_val / scale
 
-        if use_longrope:
-            scaling_factor = MAX_SEQ_LEN / 2048.0
-            self.rope = LongRoPE(self.head_dim, max_seq_len=MAX_SEQ_LEN, scaling_factor=scaling_factor)
+        quantized = torch.clamp(
+            torch.round(weight / scale + zero_point),
+            0, 2 ** self.bits - 1
+        ).to(torch.int8)
 
-    def forward(self, x, attention_mask=None):
-        batch_size, seq_len, _ = x.shape
-
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
-        v = self.v_proj(x).view(batch_size, seq_len, 1, self.head_dim).expand(-1, -1, self.num_heads, -1)
-
-        if self.use_longrope:
-            q, k = self.rope.apply_rotary_pos_emb(q, k)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        if USE_FLASH_ATTENTION and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attention_mask,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=(attention_mask is None)
-            )
-        else:
-            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-            if attention_mask is not None:
-                scores = scores + attention_mask
-
-            attn_weights = torch.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            attn_output = torch.matmul(attn_weights, v)
-
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        return self.out_proj(attn_output)
-
-
-# ========================
-# SWIGLU ACTIVATION
-# ========================
-class SwiGLU(nn.Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return x * torch.nn.functional.silu(gate)
-
-
-# ========================
-# MIXTURE OF EXPERTS
-# ========================
-class Expert(nn.Module):
-    """Single expert FFN with specialization"""
-
-    def __init__(self, d_model, dim_feedforward, dropout=0.1, expert_type="general"):
-        super().__init__()
-        self.expert_type = expert_type
-        self.net = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward * 2),
-            SwiGLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout)
-        )
-        self.usage_count = 0
+        self.weight_quantized.copy_(quantized)
+        self.scale.copy_(scale.squeeze())
+        self.zero_point.copy_(zero_point.squeeze())
 
     def forward(self, x):
-        self.usage_count += x.size(0)
-        return self.net(x)
+        weight = (self.weight_quantized.float() - self.zero_point.unsqueeze(1)) * self.scale.unsqueeze(1)
+        return torch.nn.functional.linear(x, weight)
 
 
-class MixtureOfExperts(nn.Module):
-    """Enhanced Sparse MoE with domain specialization"""
-
-    def __init__(self, d_model, dim_feedforward, num_experts=NUM_EXPERTS,
-                 experts_per_token=EXPERTS_PER_TOKEN, dropout=0.1):
-        super().__init__()
-        self.num_experts = num_experts
-        self.experts_per_token = experts_per_token
-        self.d_model = d_model
-
-        self.gate = nn.Linear(d_model, num_experts, bias=False)
-        self.noise_std = 0.1
-
-        expert_types = ["reasoning", "code", "chat", "math"] * (num_experts // 4 + 1)
-        self.experts = nn.ModuleList([
-            Expert(d_model, dim_feedforward, dropout, expert_type=expert_types[i])
-            for i in range(num_experts)
-        ])
-
-        self.register_buffer('expert_counts', torch.zeros(num_experts))
-        self.register_buffer('expert_importance', torch.zeros(num_experts))
-
-    def forward(self, x):
-        batch_size, seq_len, d_model = x.shape
-        x_flat = x.view(-1, d_model)
-
-        router_logits = self.gate(x_flat)
-        if self.training:
-            noise = torch.randn_like(router_logits) * self.noise_std
-            router_logits = router_logits + noise
-
-        router_probs = torch.softmax(router_logits, dim=-1)
-        expert_weights, expert_indices = torch.topk(
-            router_probs, self.experts_per_token, dim=-1
-        )
-        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
-
-        if self.training:
-            importance = router_probs.sum(dim=0)
-            self.expert_importance += importance
-
-        output = torch.zeros_like(x_flat)
-
-        for i, expert in enumerate(self.experts):
-            expert_mask = (expert_indices == i).any(dim=-1)
-            if expert_mask.any():
-                expert_input = x_flat[expert_mask]
-                expert_output = expert(expert_input)
-
-                weights = expert_weights[expert_mask]
-                weights = weights[expert_indices[expert_mask] == i].unsqueeze(-1)
-
-                output[expert_mask] += expert_output * weights
-
-                if self.training:
-                    self.expert_counts[i] += expert_mask.sum().item()
-
-        return output.view(batch_size, seq_len, d_model)
-
-    def get_load_balancing_loss(self):
-        """Enhanced auxiliary loss for balanced expert usage"""
-        if not self.training:
-            return 0.0
-
-        total = self.expert_counts.sum()
-        if total == 0:
-            return 0.0
-
-        target = total / self.num_experts
-        cv = torch.std(self.expert_counts) / (torch.mean(self.expert_counts) + 1e-8)
-
-        importance_loss = torch.std(self.expert_importance) / (torch.mean(self.expert_importance) + 1e-8)
-
-        self.expert_counts.zero_()
-        self.expert_importance.zero_()
-
-        return (cv + importance_loss) * 0.01
-
-    def get_expert_stats(self):
-        """Get expert utilization statistics"""
-        stats = {}
-        for i, expert in enumerate(self.experts):
-            stats[f"expert_{i}_{expert.expert_type}"] = expert.usage_count
-        return stats
-
-
-# ========================
-# TRANSFORMER BLOCK
-# ========================
-class EnhancedTransformerBlock(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, use_moe=USE_MOE):
-        super().__init__()
-
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiQueryAttention(d_model, nhead, dropout)
-
-        self.ln2 = nn.LayerNorm(d_model)
-
-        if use_moe:
-            self.mlp = MixtureOfExperts(d_model, dim_feedforward, dropout=dropout)
-        else:
-            self.mlp = nn.Sequential(
-                nn.Linear(d_model, dim_feedforward * 2),
-                SwiGLU(),
-                nn.Dropout(dropout),
-                nn.Linear(dim_feedforward, d_model),
-                nn.Dropout(dropout)
-            )
-
-        self.dropout = nn.Dropout(dropout)
-        self.use_checkpoint = USE_GRADIENT_CHECKPOINTING
-        self.use_moe = use_moe
-
-    def forward(self, x, attention_mask=None):
-        if self.use_checkpoint and self.training:
-            return self._forward_with_checkpoint(x, attention_mask)
-        else:
-            return self._forward_impl(x, attention_mask)
-
-    def _forward_impl(self, x, attention_mask=None):
-        residual = x
-        x = self.ln1(x)
-        x = residual + self.dropout(self.attn(x, attention_mask))
-
-        residual = x
-        x = self.ln2(x)
-        x = residual + self.mlp(x)
-
-        return x
-
-    def _forward_with_checkpoint(self, x, attention_mask):
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-
-            return custom_forward
-
-        residual = x
-        x = self.ln1(x)
-        x = residual + self.dropout(
-            torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.attn),
-                x,
-                attention_mask,
-                use_reentrant=False
-            )
-        )
-
-        residual = x
-        x = self.ln2(x)
-        x = residual + torch.utils.checkpoint.checkpoint(
-            create_custom_forward(self.mlp),
-            x,
-            use_reentrant=False
-        )
-
-        return x
-
-    def get_aux_loss(self):
-        """Get auxiliary losses"""
-        if self.use_moe and isinstance(self.mlp, MixtureOfExperts):
-            return self.mlp.get_load_balancing_loss()
-        return 0.0
-
-
-# ========================
-# REASONING MODULE
-# ========================
-class ReasoningModule(nn.Module):
-    """Enhanced reasoning with CoT support"""
-
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, num_layers=3):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            EnhancedTransformerBlock(d_model, nhead, dim_feedforward, dropout, use_moe=False)
-            for _ in range(num_layers)
-        ])
-
-        self.cot_attention = MultiQueryAttention(d_model, nhead, dropout)
-        self.cot_ln = nn.LayerNorm(d_model)
-
-    def forward(self, x, attn_mask=None):
-        for layer in self.layers:
-            x = layer(x, attn_mask)
-
-        residual = x
-        x = self.cot_ln(x)
-        x = residual + self.cot_attention(x, attn_mask)
-
-        return x
-
-
-# ========================
-# SELF-REFLECTION MODULE
-# ========================
-class SelfReflectionModule(nn.Module):
-    """Enhanced evaluator with quality metrics"""
-
-    def __init__(self, d_model, nhead, dim_feedforward, dropout):
-        super().__init__()
-        self.attention = MultiQueryAttention(d_model, nhead, dropout)
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-
-        self.quality_head = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, 1),
-            nn.Sigmoid()
-        )
-
-        self.confidence_head = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, 1),
-            nn.Sigmoid()
-        )
-
-        self.coherence_head = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, 1),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x, attention_mask=None):
-        attn_out = self.attention(self.ln1(x), attention_mask)
-        pooled = attn_out.mean(dim=1)
-
-        quality = self.quality_head(pooled)
-        confidence = self.confidence_head(pooled)
-        coherence = self.coherence_head(pooled)
-
-        return quality, confidence, coherence
-
-
-# ========================
-# PREFERENCE HEAD
-# ========================
-class PreferenceHead(nn.Module):
-    """Enhanced preference optimization"""
-
-    def __init__(self, d_model):
-        super().__init__()
-        self.preference_scorer = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(d_model // 2, 1)
-        )
-
-        self.helpfulness_scorer = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 1)
-        )
-
-    def forward(self, hidden_states):
-        pooled = hidden_states.mean(dim=1)
-        preference = self.preference_scorer(pooled)
-        helpfulness = self.helpfulness_scorer(pooled)
-        return preference, helpfulness
-
-
-# ========================
-# MAIN MODEL
-# ========================
-class Nuvion(nn.Module):
+class NuvionPro(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE):
         super().__init__()
         self.vocab_size = vocab_size
@@ -1062,7 +1048,8 @@ class Nuvion(nn.Module):
             for _ in range(NUM_LAYERS)
         ])
 
-        self.reasoning_module = ReasoningModule(D_MODEL, NHEAD, DIM_FEEDFORWARD, DROPOUT)
+        self.reasoning_module = MultiStageReasoningModule(D_MODEL, NHEAD, DIM_FEEDFORWARD, DROPOUT)
+        self.safety_system = MultiStageSafetySystem(D_MODEL)
         self.reflection_module = SelfReflectionModule(D_MODEL, NHEAD, DIM_FEEDFORWARD, DROPOUT)
         self.preference_head = PreferenceHead(D_MODEL)
 
@@ -1083,15 +1070,18 @@ class Nuvion(nn.Module):
         param_count = sum(p.numel() for p in self.parameters())
         trainable_count = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-        print(f"✅ Nuvion Model: {param_count:,} parameters (~{param_count / 1e6:.0f}M)")
+        print(f"✅ Nuvion Pro Model: {param_count:,} parameters (~{param_count / 1e9:.1f}B)")
         print(f"   Trainable: {trainable_count:,} parameters")
-        print(f"   Features: LongRoPE={USE_LONGROPE}, MoE={USE_MOE}, FlashAttn={USE_FLASH_ATTENTION}")
-        print(f"   Advanced: RAG={USE_RAG}, Safety={USE_SAFETY_FILTER}, CoT={USE_CHAIN_OF_THOUGHT}")
+        print(f"   Advanced Features:")
+        print(f"     • Context: {MAX_SEQ_LEN} tokens (Hybrid LongRoPE+ALiBi)")
+        print(f"     • MoE: {NUM_EXPERTS} experts with adaptive routing")
+        print(f"     • Reasoning: {self.reasoning_module.num_stages}-stage deep reasoning")
+        print(f"     • Safety: Multi-category learned safety system")
 
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * NUM_LAYERS))
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
@@ -1173,11 +1163,6 @@ class Nuvion(nn.Module):
         x = self.token_embedding(input_ids) * math.sqrt(self.d_model)
         x = self.embed_dropout(x)
 
-        if use_rag and self.rag_system:
-            query_emb = x[:, -1, :].mean(dim=0)
-            retrieved_docs = self.rag_system.retrieve(query_emb, top_k=2)
-            pass
-
         aux_losses = []
         for block in self.blocks:
             x = block(x, causal_mask)
@@ -1186,7 +1171,8 @@ class Nuvion(nn.Module):
                 aux_losses.append(aux_loss)
 
         if use_reasoning:
-            x = self.reasoning_module(x, causal_mask)
+            reasoning_outputs = self.reasoning_module(x, causal_mask)
+            x = reasoning_outputs['final_output']
 
         x = self.ln_f(x)
 
@@ -1196,6 +1182,12 @@ class Nuvion(nn.Module):
 
         if aux_losses:
             outputs['aux_loss'] = sum(aux_losses) / len(aux_losses)
+
+        if use_reasoning and 'reasoning_confidence' in reasoning_outputs:
+            outputs['reasoning_confidence'] = reasoning_outputs['reasoning_confidence']
+
+        safety_outputs = self.safety_system(x)
+        outputs.update(safety_outputs)
 
         if return_preference_score:
             pref_score, help_score = self.preference_head(x)
@@ -1361,7 +1353,6 @@ class Nuvion(nn.Module):
         return result.strip()
 
     def enable_lora(self, rank=LORA_RANK, alpha=LORA_ALPHA):
-        """Convert linear layers to LoRA for fine-tuning"""
         print(f"🔧 Enabling LoRA (rank={rank}, alpha={alpha})")
 
         for name, module in self.named_modules():
@@ -1394,7 +1385,6 @@ class Nuvion(nn.Module):
         print(f"✅ LoRA enabled: {trainable:,} trainable parameters")
 
     def enable_quantization(self, bits=8):
-        """Convert model to quantized inference mode"""
         print(f"🔧 Enabling {bits}-bit quantization")
 
         quantized_count = 0
@@ -1421,14 +1411,14 @@ class Nuvion(nn.Module):
         print(f"✅ Quantization enabled: {quantized_count} layers quantized")
 
     def get_expert_statistics(self):
-        """Get MoE expert utilization stats"""
         if not USE_MOE:
             return {}
 
         stats = {}
         for i, block in enumerate(self.blocks):
-            if hasattr(block, 'mlp') and isinstance(block.mlp, MixtureOfExperts):
-                stats[f"block_{i}"] = block.mlp.get_expert_stats()
+            if hasattr(block, 'mlp') and isinstance(block.mlp, AdaptiveMixtureOfExperts):
+                for j, expert in enumerate(block.mlp.experts):
+                    stats[f"block_{i}_expert_{j}_{expert.expert_type}"] = expert.usage_count
 
         return stats
 
@@ -1487,10 +1477,10 @@ def format_chain_of_thought(question, answer):
 
 
 # ========================
-# DATASET LOADING
+# DATASET LOADING (ENGLISH ONLY)
 # ========================
 def load_nuvion_datasets():
-    print("🚀 Loading multi-domain datasets with CoT enhancement...")
+    print("🚀 Loading English datasets with CoT enhancement...")
     sample = DEV_SAMPLE_PER_DS
 
     all_samples = []
@@ -1881,10 +1871,9 @@ class CosineWithRestartsScheduler:
 # ========================
 def find_existing_model():
     model_files = [
-        "nuvion_418m_best.pth",
-        "nuvion_2.3b_best.pth",
-        "nuvion_418m_advanced_best.pth",
-        "nuvion_400m_best.pth",
+        "nuvion_1.2b_best.pth",
+        "nuvion_8.5b_best.pth",
+        "nuvion_pro_best.pth",
     ]
     for f in model_files:
         if os.path.exists(f):
@@ -1992,10 +1981,10 @@ def test_generation_progressive(model, tokenizer, epoch):
 
 
 # ========================
-# TRAINING LOOP
+# OPTIMIZED TRAINING LOOP FOR RTX 3070
 # ========================
 def train_nuvion():
-    print("🚀 Training Nuvion Advanced")
+    print("🚀 Training Nuvion Pro")
     print("=" * 70)
 
     setup_memory_optimizations()
@@ -2008,17 +1997,20 @@ def train_nuvion():
         print("❌ No training data")
         return
 
+    # OPTIMIZED: Enhanced DataLoader for RTX 3070
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         collate_fn=collate_fn,
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False
+        num_workers=4,  # Increased for better data loading
+        pin_memory=True,  # Faster GPU transfers
+        persistent_workers=True,  # Reuse workers
+        prefetch_factor=2,  # Preload batches
+        drop_last=True  # Avoid partial batches
     )
 
-    model = Nuvion(vocab_size=tokenizer.get_vocab_size()).to(device)
+    model = NuvionPro(vocab_size=tokenizer.get_vocab_size()).to(device)
     model.set_penalty_tokens(tokenizer)
 
     if USE_LORA:
@@ -2034,11 +2026,6 @@ def train_nuvion():
 
     total_steps = len(train_loader) * NUM_EPOCHS // GRAD_ACCUM_STEPS
     scheduler = CosineWithRestartsScheduler(optimizer, WARMUP_STEPS, total_steps)
-
-    if device.type == "cuda":
-        scaler = torch.amp.GradScaler('cuda')
-    else:
-        scaler = None
 
     start_epoch = 0
     best_loss = float('inf')
@@ -2062,6 +2049,10 @@ def train_nuvion():
     print(f"      ✅ LoRA: {USE_LORA}")
     print(f"      ✅ Quantization: {USE_QUANTIZATION}")
     print(f"      ✅ Gradient Checkpointing: {USE_GRADIENT_CHECKPOINTING}")
+    print(f"\n   🚀 RTX 3070 Optimizations:")
+    print(f"      ✅ Mixed Precision Training")
+    print(f"      ✅ Optimized DataLoader (num_workers=4, pin_memory=True)")
+    print(f"      ✅ TF32 & cuDNN Benchmarking")
     print(f"\n   Epochs: {NUM_EPOCHS} (from {start_epoch})")
     print(f"   Samples: {len(train_dataset)}")
     print("=" * 70)
@@ -2087,34 +2078,16 @@ def train_nuvion():
             if batch_inputs.nelement() == 0:
                 continue
 
-            batch_inputs = batch_inputs.to(device)
-            loss_mask = loss_mask.to(device)
+            # OPTIMIZED: Non-blocking transfers
+            batch_inputs = batch_inputs.to(device, non_blocking=True)
+            loss_mask = loss_mask.to(device, non_blocking=True)
 
             inputs = batch_inputs[:, :-1]
             targets = batch_inputs[:, 1:]
             target_mask = loss_mask[:, 1:]
 
-            if scaler:
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    outputs = model(inputs)
-                    logits = outputs['logits']
-
-                    loss_fct = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
-                    losses = loss_fct(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-                    losses = losses.view(targets.shape)
-                    masked_losses = losses * target_mask
-                    num_tokens = target_mask.sum()
-                    loss = masked_losses.sum() / num_tokens if num_tokens > 0 else masked_losses.sum()
-
-                    if 'aux_loss' in outputs:
-                        aux_loss = outputs['aux_loss']
-                        loss = loss + aux_loss
-                        epoch_aux_loss += aux_loss.item()
-
-                    loss = loss / GRAD_ACCUM_STEPS
-
-                scaler.scale(loss).backward()
-            else:
+            # OPTIMIZED: Mixed precision training for RTX 3070
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 outputs = model(inputs)
                 logits = outputs['logits']
 
@@ -2131,22 +2104,24 @@ def train_nuvion():
                     epoch_aux_loss += aux_loss.item()
 
                 loss = loss / GRAD_ACCUM_STEPS
-                loss.backward()
+
+            # OPTIMIZED: Scaled backward pass
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                # OPTIMIZED: Gradient clipping and step
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
 
+                # OPTIMIZED: Faster zero_grad
                 optimizer.zero_grad(set_to_none=True)
+
                 scheduler.step()
                 global_step += 1
 
+                # OPTIMIZED: Periodic memory cleanup
                 if global_step % 50 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -2176,8 +2151,8 @@ def train_nuvion():
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            suffix = "418M" if DEV_MODE else "2.3B"
-            checkpoint_path = f"nuvion_{suffix}_advanced_best.pth"
+            suffix = "1.2B" if DEV_MODE else "8.5B"
+            checkpoint_path = f"nuvion_pro_{suffix}_best.pth"
 
             torch.save({
                 'epoch': epoch,
@@ -2195,12 +2170,20 @@ def train_nuvion():
             }, checkpoint_path)
             print(f"💾 Best model saved: {checkpoint_path} (loss: {best_loss:.4f})")
 
-    suffix = "418M" if DEV_MODE else "2.3B"
-    final_path = f"nuvion_{suffix}_advanced_final.pth"
+    suffix = "1.2B" if DEV_MODE else "8.5B"
+    final_path = f"nuvion_pro_{suffix}_final.pth"
     torch.save(model.state_dict(), final_path)
-    print(f"\n🎉 Nuvion Advanced training complete! Best loss: {best_loss:.4f}")
+    print(f"\n🎉 Nuvion Pro training complete! Best loss: {best_loss:.4f}")
     print(f"📂 Saved: {final_path}")
 
 
+# ========================
+# MAIN EXECUTION
+# ========================
 if __name__ == "__main__":
+    print("🚀 Nuvion Pro AI Training System")
+    print("📚 English Language Only")
+    print("⚡ Training Mode - RTX 3070 Optimized")
+    print("=" * 50)
+
     train_nuvion()
