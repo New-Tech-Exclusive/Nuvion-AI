@@ -19,7 +19,7 @@ import time
 # ========================
 # CONFIGURATION
 # ========================
-DEV_MODE = False
+DEV_MODE = True
 DEV_SAMPLE_PER_DS = 8000 if DEV_MODE else None
 MAX_SEQ_LEN = 2048
 BATCH_SIZE = 1 if DEV_MODE else 1
@@ -35,13 +35,13 @@ if DEV_MODE:
     NHEAD = 16
     NUM_LAYERS = 24
     DIM_FEEDFORWARD = 4096
-    MODEL_SIZE = "400M"
+    MODEL_SIZE = "418M"
 else:
     D_MODEL = 2048
     NHEAD = 32
     NUM_LAYERS = 36
     DIM_FEEDFORWARD = 8192
-    MODEL_SIZE = "1.5B"
+    MODEL_SIZE = "2.3B"
 
 DROPOUT = 0.1
 VOCAB_SIZE = 32000
@@ -58,7 +58,7 @@ REASONING_START_MARKER = "###REASONING###"
 REASONING_END_MARKER = "###END_REASONING###"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 Nuvion | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
+print(f"🚀 ULTIMATE MERGED | Device={device} | Model: ~{MODEL_SIZE} | Context: {MAX_SEQ_LEN}")
 
 
 # ========================
@@ -513,7 +513,7 @@ class ReasoningModule(nn.Module):
 # ========================
 # MAIN MODEL
 # ========================
-class Nuvion(nn.Module):
+class UltimateNuvionGPT(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE):
         super().__init__()
         self.vocab_size = vocab_size
@@ -540,7 +540,7 @@ class Nuvion(nn.Module):
 
         self._init_weights()
         param_count = sum(p.numel() for p in self.parameters())
-        print(f"✅ Nuvion Model: {param_count:,} parameters (~{param_count / 1e6:.0f}M)")
+        print(f"✅ Ultimate Model: {param_count:,} parameters (~{param_count / 1e6:.0f}M)")
 
     def _init_weights(self):
         for module in self.modules():
@@ -788,7 +788,7 @@ def is_code_heavy(text):
 # ========================
 # DATASET LOADING
 # ========================
-def load_nuvion_datasets():
+def load_ultimate_datasets():
     print("🚀 Loading multi-domain datasets...")
     sample = DEV_SAMPLE_PER_DS
 
@@ -1032,7 +1032,7 @@ def safe_load_dataset(name, split="train", sample=None, config=None):
 # ========================
 # TOKENIZER
 # ========================
-def get_or_train_tokenizer(dataset, path="tokenizer_nuvion.json"):
+def get_or_train_tokenizer(dataset, path="tokenizer_ultimate.json"):
     if os.path.exists(path):
         print(f"Loading tokenizer from {path}")
         return Tokenizer.from_file(path)
@@ -1062,7 +1062,7 @@ def get_or_train_tokenizer(dataset, path="tokenizer_nuvion.json"):
 # ========================
 # DATASET
 # ========================
-class NuvionDataset(Dataset):
+class UltimateDataset(Dataset):
     def __init__(self, dataset, tokenizer):
         self.samples = []
         self.masks = []
@@ -1157,9 +1157,9 @@ class CosineWithRestartsScheduler:
 # ========================
 def find_existing_model():
     model_files = [
-        "nuvion_400m_best.pth",
-        "nuvion_1.5b_best.pth",
-        "nuvion_400m_final.pth",
+        "nuvion_ultimate_400m_best.pth",
+        "nuvion_ultimate_1.5b_best.pth",
+        "nuvion_ultimate_400m_final.pth",
     ]
     for f in model_files:
         if os.path.exists(f):
@@ -1256,16 +1256,16 @@ def test_generation_progressive(model, tokenizer, epoch):
 # ========================
 # TRAINING LOOP
 # ========================
-def train_nuvion():
-    print("🚀 Training Nuvion")
+def train_ultimate():
+    print("🚀 Training ULTIMATE Nuvion GPT")
     print("=" * 70)
 
     setup_memory_optimizations()
 
-    dataset = load_nuvion_datasets()
+    dataset = load_ultimate_datasets()
     tokenizer = get_or_train_tokenizer(dataset)
 
-    train_dataset = NuvionDataset(dataset, tokenizer)
+    train_dataset = UltimateDataset(dataset, tokenizer)
     if len(train_dataset) == 0:
         print("❌ No training data")
         return
@@ -1280,7 +1280,7 @@ def train_nuvion():
         persistent_workers=False
     )
 
-    model = Nuvion(vocab_size=tokenizer.get_vocab_size()).to(device)
+    model = UltimateNuvionGPT(vocab_size=tokenizer.get_vocab_size()).to(device)
     model.set_penalty_tokens(tokenizer)
 
     optimizer = optim.AdamW(
@@ -1399,7 +1399,7 @@ def train_nuvion():
         if avg_loss < best_loss:
             best_loss = avg_loss
             suffix = "400m" if DEV_MODE else "1.5b"
-            checkpoint_path = f"nuvion_{suffix}_best.pth"
+            checkpoint_path = f"nuvion_ultimate_{suffix}_best.pth"
 
             torch.save({
                 'epoch': epoch,
@@ -1417,13 +1417,13 @@ def train_nuvion():
             }, checkpoint_path)
             print(f"💾 Best model saved: {checkpoint_path} (loss: {best_loss:.4f})")
 
-    suffix = "400m" if DEV_MODE else "1.5b"
-    final_path = f"nuvion_{suffix}_final.pth"
+    suffix = "418M" if DEV_MODE else "2.3B"
+    final_path = f"nuvion_ultimate_{suffix}_final.pth"
     torch.save(model.state_dict(), final_path)
-    print(f"\n🎉 Nuvion training complete! Best loss: {best_loss:.4f}")
+    print(f"\n🎉 Ultimate training complete! Best loss: {best_loss:.4f}")
     print(f"📁 Saved: {final_path}")
-    print("\n💡 Run nuvion_chat.py to interact with your model!")
+    print("\n💡 Run nuvion_ultimate_chat.py to interact with your model!")
 
 
 if __name__ == "__main__":
-    train_nuvion()
+    train_ultimate()
