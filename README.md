@@ -9,3 +9,8 @@
 - 🚀 **400M Parameters** — Strikes a balance between deployability and expressive conversational ability.  
 - ⚡ **Efficient Training Pipeline** — Distributed training, mixed precision, and modular design.  
 - 🗂️ **Dataset Flexibility** — Works with DailyDialog, OpenSubtitles, or custom corpora.  
+
+---
+
+## 🚀 Current model
+- ⚡ **Nuvion Advanced** - Has many different customizations, architecture option (Mixture of Experts, Model Parameters, Etc...) 
